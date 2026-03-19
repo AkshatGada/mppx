@@ -115,6 +115,21 @@
       "src": "./src/mcp-sdk/server/index.ts",
       "default": "./dist/mcp-sdk/server/index.js"
     },
+    "./polygon": {
+      "types": "./dist/polygon/index.d.ts",
+      "src": "./src/polygon/index.ts",
+      "default": "./dist/polygon/index.js"
+    },
+    "./polygon/client": {
+      "types": "./dist/polygon/client/index.d.ts",
+      "src": "./src/polygon/client/index.ts",
+      "default": "./dist/polygon/client/index.js"
+    },
+    "./polygon/server": {
+      "types": "./dist/polygon/server/index.d.ts",
+      "src": "./src/polygon/server/index.ts",
+      "default": "./dist/polygon/server/index.js"
+    },
     "./proxy": {
       "types": "./dist/proxy/index.d.ts",
       "src": "./src/proxy/index.ts",
