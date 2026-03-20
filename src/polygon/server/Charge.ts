@@ -24,7 +24,7 @@ const TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a
  * const mppx = Mppx.create({
  *   methods: [
  *     polygon({
- *       rpcUrl: 'https://polygon-rpc.com',
+ *       rpcUrl: 'https://rpc.ankr.com/polygon',
  *       currency: '0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359', // USDC
  *       decimals: 6,
  *     }),
@@ -57,14 +57,15 @@ export function charge<const parameters extends charge.Parameters>(parameters: p
         throw new PaymentExpiredError({ expires: challenge.expires })
 
       const parsed = Methods.charge.schema.credential.payload.safeParse(credential.payload)
-      if (!parsed.success) throw new Error('Invalid credential payload')
+      if (!parsed.success) throw new VerificationFailedError({ reason: 'Invalid credential payload' })
 
       const payload = parsed.data
+      const hash = payload.hash as `0x${string}`
 
       // Fetch the receipt from the chain
       const receipt = provider
-        ? await provider.getTransactionReceipt(payload.hash)
-        : await fetchReceipt(rpcUrl!, payload.hash)
+        ? await provider.getTransactionReceipt(hash)
+        : await fetchReceipt(rpcUrl!, hash)
 
       if (!receipt) throw new VerificationFailedError({ reason: 'Transaction not found' })
       if (receipt.status !== 'success' && receipt.status !== '0x1')
@@ -72,7 +73,9 @@ export function charge<const parameters extends charge.Parameters>(parameters: p
 
       const expectedCurrency = (request.currency as string).toLowerCase()
       const expectedAmount = BigInt(request.amount as string)
-      const expectedRecipient = (request.recipient as string).toLowerCase()
+      const expectedRecipient = request.recipient
+        ? (request.recipient as string).toLowerCase()
+        : undefined
 
       const transferLog = findTransferLog(receipt.logs, {
         currency: expectedCurrency,
@@ -89,7 +92,7 @@ export function charge<const parameters extends charge.Parameters>(parameters: p
         method: 'polygon',
         status: 'success',
         timestamp: new Date().toISOString(),
-        reference: payload.hash,
+        reference: hash,
       } as const
     },
   })
@@ -119,14 +122,14 @@ export declare namespace charge {
 /** Finds a matching ERC-20 Transfer log in a receipt. */
 function findTransferLog(
   logs: readonly { address: string; topics: readonly string[]; data: string }[],
-  expected: { currency: string; recipient: string; amount: bigint },
+  expected: { currency: string; recipient: string | undefined; amount: bigint },
 ) {
   return logs.find((log) => {
     if (log.address.toLowerCase() !== expected.currency) return false
     if (!log.topics[0] || log.topics[0] !== TRANSFER_TOPIC) return false
     if (!log.topics[2]) return false
     const to = `0x${log.topics[2].slice(26)}`.toLowerCase()
-    if (to !== expected.recipient) return false
+    if (expected.recipient && to !== expected.recipient) return false
     const value = BigInt(log.data)
     return value >= expected.amount
   })

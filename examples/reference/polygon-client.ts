@@ -15,7 +15,7 @@ const account = privateKeyToAccount('0x...' as `0x${string}`)
 const walletClient = createWalletClient({
   account,
   chain: polygonChain,
-  transport: http('https://polygon-rpc.com'),
+  transport: http('https://rpc.ankr.com/polygon'),
 })
 
 const erc20Abi = parseAbi(['function transfer(address to, uint256 amount) returns (bool)'])

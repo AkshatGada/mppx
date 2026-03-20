@@ -25,5 +25,5 @@ export const decimals = 6
 
 /** Default RPC URLs for Polygon. */
 export const rpcUrl = {
-  [chainId.mainnet]: 'https://polygon-rpc.com',
+  [chainId.mainnet]: 'https://rpc.ankr.com/polygon',
 } as const satisfies Record<ChainId, string>

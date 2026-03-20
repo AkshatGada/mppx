@@ -7,7 +7,19 @@
  *
  * Run: npx tsx examples/polygon/src/server.ts
  */
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
 import { Mppx, polygon } from '../../../src/server/index.js'
+
+// Load .env from repo root
+const envPath = resolve(import.meta.dirname ?? '.', '../../../.env')
+try {
+  const envContent = readFileSync(envPath, 'utf-8')
+  for (const line of envContent.split('\n')) {
+    const match = line.match(/^([^#=]+)=(.*)$/)
+    if (match) process.env[match[1]!.trim()] = match[2]!.trim()
+  }
+} catch {}
 
 const USDC_POLYGON = '0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359'
 const RECIPIENT = '0xFd13B3f3f876e100898B72F06A500B5a9E9d1F9C' // from .env PRIVATE_KEY
@@ -15,7 +27,7 @@ const RECIPIENT = '0xFd13B3f3f876e100898B72F06A500B5a9E9d1F9C' // from .env PRIV
 const mppx = Mppx.create({
   methods: [
     polygon({
-      rpcUrl: 'https://polygon-rpc.com',
+      rpcUrl: 'https://rpc-mainnet.matic.quiknode.pro',
       currency: USDC_POLYGON,
       decimals: 6,
     }),

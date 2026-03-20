@@ -13,7 +13,7 @@ const RECIPIENT = '0xYourWalletAddress'
 const mppx = Mppx.create({
   methods: [
     polygon({
-      rpcUrl: 'https://polygon-rpc.com',
+      rpcUrl: 'https://rpc.ankr.com/polygon',
       currency: USDC_POLYGON,
       decimals: 6,
     }),

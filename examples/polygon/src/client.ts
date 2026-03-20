@@ -12,7 +12,7 @@
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { Mppx, polygon } from '../../../src/client/index.js'
-import { createWalletClient, http, parseAbi } from 'viem'
+import { createPublicClient, createWalletClient, http, parseAbi } from 'viem'
 import { privateKeyToAccount } from 'viem/accounts'
 import { polygon as polygonChain } from 'viem/chains'
 
@@ -38,10 +38,17 @@ if (!privateKey) {
 const account = privateKeyToAccount(`0x${privateKey.replace(/^0x/, '')}`)
 console.log(`\n  Wallet: ${account.address}`)
 
+const transport = http('https://rpc-mainnet.matic.quiknode.pro')
+
 const walletClient = createWalletClient({
   account,
   chain: polygonChain,
-  transport: http('https://polygon-rpc.com'),
+  transport,
+})
+
+const publicClient = createPublicClient({
+  chain: polygonChain,
+  transport,
 })
 
 const erc20Abi = parseAbi(['function transfer(address to, uint256 amount) returns (bool)'])
@@ -60,6 +67,9 @@ const mppx = Mppx.create({
           args: [recipient, BigInt(amount)],
         })
         console.log(`  Tx hash: ${hash}`)
+        console.log(`  Waiting for confirmation...`)
+        await publicClient.waitForTransactionReceipt({ hash })
+        console.log(`  Confirmed ✓`)
         return hash
       },
     }),
