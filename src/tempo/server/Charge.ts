@@ -894,11 +894,24 @@ export function charge<const parameters extends charge.Parameters>(
               })
             return toReceipt(reference, fundingCurrency)
           } catch (error) {
-            if (!broadcastAttempted) {
-              if (reservation) await SponsorBudget.release(sponsorBudgetStore!, reservation)
-              if (claimedFinalHash) await releaseHashUse(store, claimedFinalHash)
-              await releaseHashUse(store, hash)
+            if (reservation) {
+              try {
+                // A broadcast transaction may still land, so its fee stays reserved
+                // until reconciliation observes a receipt or the reservation expires.
+                if (broadcastAttempted)
+                  await SponsorBudget.transition(sponsorBudgetStore!, reservation, 'pending')
+                else await SponsorBudget.release(sponsorBudgetStore!, reservation)
+              } catch (budgetError) {
+                // The reservation expires on its own; the settlement error and
+                // claim cleanup take precedence.
+                console.error('mppx: sponsor budget cleanup error', budgetError)
+              }
             }
+            // Only a successful settlement consumes the credential. A signed
+            // transaction can be mined at most once, so a retry re-broadcasts it
+            // and recovers the receipt instead of being rejected as a replay.
+            if (claimedFinalHash) await releaseHashUse(store, claimedFinalHash)
+            await releaseHashUse(store, hash)
             throw error
           }
         }
