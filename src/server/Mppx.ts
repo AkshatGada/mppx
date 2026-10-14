@@ -189,6 +189,11 @@ export type PaymentSuccessContext<
     | undefined
   input?: Transport.InputOf<transport> | undefined
   method: ServerMethodDescriptor<method>
+  /**
+   * Payer identity verified by the method before settlement (for example, the
+   * Tempo sender address). Absent when the method does not report one.
+   */
+  payer?: string | undefined
   receipt: Receipt.Receipt
   /** Canonical request represented by the challenge. */
   request: z.output<method['schema']['request']>
@@ -908,9 +913,10 @@ export function create<
     }
 
     let receipt: Receipt.Receipt
+    let validation: Method.Validation | undefined
     try {
       if (mi.broadcast && mi.validate)
-        await mi.validate({
+        validation = await mi.validate({
           credential: parsedCredential,
           envelope,
           operation: 'broadcast',
@@ -939,6 +945,7 @@ export function create<
         credential: parsedCredential,
         envelope,
         method: mi,
+        payer: validation?.payer,
         receipt,
         request: parsedRequest,
         ...(requestInput !== undefined && { requestInput }),
@@ -1547,9 +1554,10 @@ function createMethodFn(parameters: createMethodFn.Parameters): createMethodFn.R
       // User-provided verification (e.g., check signature, submit tx, verify payment).
       // If verification fails, re-issue the challenge so the client can retry.
       let receiptData: Receipt.Receipt
+      let validation: Method.Validation | undefined
       try {
         if (broadcast && validate)
-          await validate({
+          validation = await validate({
             credential: parsedCredential,
             envelope,
             operation: 'broadcast',
@@ -1607,6 +1615,7 @@ function createMethodFn(parameters: createMethodFn.Parameters): createMethodFn.R
           envelope,
           input,
           method,
+          payer: validation?.payer,
           receipt: receiptData,
           request: parsedRequest,
           requestInput: request,
@@ -1782,6 +1791,7 @@ function createServerEventDispatcher<
           await method.onPaymentSuccess({
             challenge: success.challenge,
             input: success.input,
+            ...(success.payer !== undefined && { payer: success.payer }),
             receipt: success.receipt,
             request: success.request,
             ...(success.requestInput !== undefined && { requestInput: success.requestInput }),
@@ -1892,6 +1902,7 @@ function createPaymentSuccessContext(parameters: {
   envelope?: Method.VerifiedChallengeEnvelope | undefined
   input?: unknown
   method: Method.Method | ServerMethodDescriptor
+  payer?: string | undefined
   receipt: Receipt.Receipt
   request: Record<string, unknown>
   requestInput?: Record<string, unknown> | undefined
@@ -1905,6 +1916,7 @@ function createPaymentSuccessContext(parameters: {
     ...(parameters.envelope ? { envelope: snapshotVerifiedEnvelope(parameters.envelope) } : {}),
     ...snapshotInputProperty(parameters.input),
     method: snapshotMethod(parameters.method),
+    ...(parameters.payer !== undefined && { payer: parameters.payer }),
     receipt: snapshotValue(parameters.receipt),
     request: snapshotValue(parameters.request),
     ...(parameters.requestInput !== undefined && {
