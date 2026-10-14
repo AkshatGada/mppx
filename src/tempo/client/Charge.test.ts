@@ -4,7 +4,7 @@ import { type Address, createClient, http, isAddressEqual } from 'viem'
 import { privateKeyToAccount } from 'viem/accounts'
 import { tempoLocalnet } from 'viem/chains'
 import { Account, Addresses, Secp256k1 } from 'viem/tempo'
-import { describe, expect, test, vi } from 'vp/test'
+import { afterEach, describe, expect, test, vi } from 'vp/test'
 
 import * as defaults from '../internal/defaults.js'
 import * as Methods from '../Methods.js'
@@ -962,6 +962,146 @@ describe('tempo.charge client', () => {
       vi.doUnmock('viem/actions')
       vi.resetModules()
     }
+  })
+
+  describe('validBefore', () => {
+    const base = 1_800_000_000
+    const at = (seconds: number) => new Date(seconds * 1000).toISOString()
+
+    test.each([
+      { label: 'no challenge expiry', now: base, expires: undefined, expected: base + 25 },
+      { label: 'expiry after the window', now: base, expires: at(base + 60), expected: base + 25 },
+      { label: 'expiry inside the window', now: base, expires: at(base + 10), expected: base + 11 },
+      { label: 'fractional expiry', now: base, expires: at(base + 10.5), expected: base + 11 },
+      { label: 'sub-second expiry', now: base + 0.2, expires: at(base + 0.5), expected: base + 1 },
+      { label: 'expiry is now', now: base + 0.5, expires: at(base + 0.5), expected: base + 1 },
+      { label: 'whole-second expiry is now', now: base, expires: at(base), expected: base + 1 },
+      {
+        label: 'millisecond expiry',
+        now: base + 0.998,
+        expires: at(base + 0.999),
+        expected: base + 1,
+      },
+    ])('caps at the challenge expiry: $label', async ({ now, expires, expected }) => {
+      vi.resetModules()
+      vi.useFakeTimers({ now: now * 1000, toFake: ['Date'] })
+      const prepareTransactionRequest = vi.fn(
+        async (_client: unknown, _parameters: Record<string, unknown>) => ({}),
+      )
+      vi.doMock('viem/actions', () => ({
+        prepareTransactionRequest,
+        sendCallsSync: vi.fn(),
+        signTransaction: vi.fn(async () => '0xdeadbeef'),
+        signTypedData: vi.fn(),
+      }))
+
+      try {
+        const { charge: chargeWithMockedActions } = await import('./Charge.js')
+        const client = createClient({
+          account,
+          chain: { ...tempoLocalnet, id: 42431 },
+          transport: http('http://127.0.0.1'),
+        })
+        const method = chargeWithMockedActions({ account, getClient: () => client })
+
+        await method.createCredential({
+          challenge: {
+            ...createChallenge({ amount: '1', chainId: 42431, supportedModes: ['pull'] }),
+            ...(expires ? { expires } : {}),
+          },
+          context: {},
+        })
+
+        const parameters = prepareTransactionRequest.mock.calls[0]?.[1]
+        expect(parameters).toMatchObject({ nonceKey: 'expiring', validBefore: expected })
+        // Still valid at signing time, even when the challenge expires this second.
+        expect(parameters?.validBefore).toBeGreaterThan(now)
+      } finally {
+        vi.useRealTimers()
+        vi.doUnmock('viem/actions')
+        vi.resetModules()
+      }
+    })
+  })
+
+  describe('in-flight signing', () => {
+    const challenge = (id = 'shared', recipient?: Address) => {
+      const base = createChallenge({ amount: '1', chainId: 42431, supportedModes: ['pull'] })
+      return { ...base, id, request: { ...base.request, ...(recipient ? { recipient } : {}) } }
+    }
+
+    async function setup(options: Partial<Parameters<typeof charge>[0]> = {}) {
+      vi.resetModules()
+      let signings = 0
+      const signTransaction = vi.fn(async () => `0x76${(signings++).toString(16).padStart(4, '0')}`)
+      vi.doMock('viem/actions', () => ({
+        prepareTransactionRequest: vi.fn(async () => ({})),
+        sendCallsSync: vi.fn(),
+        signTransaction,
+        signTypedData: vi.fn(),
+      }))
+      const { charge: chargeWithMockedActions } = await import('./Charge.js')
+      const client = createClient({
+        account,
+        chain: { ...tempoLocalnet, id: 42431 },
+        transport: http('http://127.0.0.1'),
+      })
+      const method = chargeWithMockedActions({ account, getClient: () => client, ...options })
+      return { method, signTransaction }
+    }
+
+    afterEach(() => {
+      vi.doUnmock('viem/actions')
+      vi.resetModules()
+    })
+
+    test.each([
+      { label: 'concurrent, same challenge', concurrent: true, otherId: 'shared', signings: 1 },
+      { label: 'sequential, same challenge', concurrent: false, otherId: 'shared', signings: 2 },
+      { label: 'concurrent, other challenge', concurrent: true, otherId: 'other', signings: 2 },
+    ])('signings: $label', async ({ concurrent, otherId, signings }) => {
+      const { method, signTransaction } = await setup()
+      const create = (id: string) =>
+        method.createCredential({ challenge: challenge(id), context: {} })
+
+      const [first, second] = concurrent
+        ? await Promise.all([create('shared'), create(otherId)])
+        : [await create('shared'), await create(otherId)]
+
+      expect(signTransaction).toHaveBeenCalledTimes(signings)
+      expect(first === second).toBe(signings === 1)
+    })
+
+    test('does not share a failed signing with a later call', async () => {
+      const { method, signTransaction } = await setup()
+      signTransaction.mockRejectedValueOnce(new Error('rpc down'))
+
+      await expect(
+        method.createCredential({ challenge: challenge(), context: {} }),
+      ).rejects.toThrow('rpc down')
+      await method.createCredential({ challenge: challenge(), context: {} })
+
+      expect(signTransaction).toHaveBeenCalledTimes(2)
+    })
+
+    test('enforces client policy when joining a signing', async () => {
+      const { method, signTransaction } = await setup({ expectedRecipients: [recipient] })
+
+      const [first, second] = await Promise.allSettled([
+        method.createCredential({ challenge: challenge(), context: {} }),
+        method.createCredential({
+          challenge: challenge('shared', '0x4444444444444444444444444444444444444444'),
+          context: {},
+        }),
+      ])
+
+      expect(first.status).toBe('fulfilled')
+      expect(second).toMatchObject({
+        reason: expect.objectContaining({ message: expect.stringContaining('recipient') }),
+        status: 'rejected',
+      })
+      expect(signTransaction).toHaveBeenCalledOnce()
+    })
   })
 
   describe('chain pinning', () => {

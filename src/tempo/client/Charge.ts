@@ -71,7 +71,7 @@ export function charge(parameters: charge.Parameters = {}) {
   })
   const getAccount = Account.getResolver({ account: parameters.account })
 
-  return Method.toClient(Methods.charge, {
+  const method = Method.toClient(Methods.charge, {
     // Skip offers that violate client policy so an acceptable offer can be chosen.
     canHandleChallenge({ challenge }) {
       try {
@@ -237,7 +237,9 @@ export function charge(parameters: charge.Parameters = {}) {
       const validBefore = (() => {
         const defaultExpiry = Math.floor(Date.now() / 1000) + 25
         if (!challenge.expires) return defaultExpiry
-        const challengeExpiry = Math.floor(new Date(challenge.expires).getTime() / 1000)
+        // `validBefore` is an exclusive whole-second bound, so cap at the second
+        // after a (possibly fractional) expiry to stay valid as long as the challenge.
+        const challengeExpiry = Math.floor(new Date(challenge.expires).getTime() / 1000) + 1
         return Math.min(defaultExpiry, challengeExpiry)
       })()
 
@@ -296,6 +298,24 @@ export function charge(parameters: charge.Parameters = {}) {
       })
     },
   })
+
+  // Share an in-flight signing so concurrent calls for one challenge cannot yield
+  // two independently settleable transactions. Settled signings are not reused.
+  const signing = new Map<string, Promise<string>>()
+  const createCredential: typeof method.createCredential = async (options) => {
+    // Enforce client policy on every call, including ones joining a signing.
+    assertChallengePolicy(parameters, caps, options.challenge.request)
+    const account = options.context?.account ?? parameters.account
+    const signer = (typeof account === 'string' ? account : account?.address)?.toLowerCase()
+    const key = `${signer ?? ''}:${options.challenge.id}`
+    let promise = signing.get(key)
+    if (!promise) {
+      promise = method.createCredential(options).finally(() => signing.delete(key))
+      signing.set(key, promise)
+    }
+    return promise
+  }
+  return { ...method, createCredential }
 }
 
 /** Parses `maxAmount` to base units, rejecting values that cannot be represented exactly. */
