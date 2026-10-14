@@ -5,6 +5,7 @@ import {
   BadRequestError,
   ChannelClosedError,
   ChannelNotFoundError,
+  CredentialReplayedError,
   DeltaTooSmallError,
   InsufficientBalanceError,
   InternalPaymentError,
@@ -150,6 +151,33 @@ describe('VerificationFailedError', () => {
   })
 })
 
+describe('CredentialReplayedError', () => {
+  test('default', () => {
+    expect(errorSnapshot(new CredentialReplayedError())).toMatchInlineSnapshot(`
+      {
+        "message": "Payment verification failed: Credential has already been used.",
+        "name": "CredentialReplayedError",
+        "status": 403,
+        "type": "https://paymentauth.org/problems/verification-failed",
+      }
+    `)
+  })
+
+  test.each([
+    'Transaction hash has already been used',
+    'Proof credential has already been used',
+    'memo is not bound to this challenge',
+  ])('differs from VerificationFailedError problem details only in status: %s', (reason) => {
+    const error = new CredentialReplayedError({ reason })
+
+    expect(error).toBeInstanceOf(VerificationFailedError)
+    expect(error.toProblemDetails('challenge-id')).toEqual({
+      ...new VerificationFailedError({ reason }).toProblemDetails('challenge-id'),
+      status: 403,
+    })
+  })
+})
+
 describe('InternalPaymentError', () => {
   test('default', () => {
     expect(errorSnapshot(new InternalPaymentError())).toMatchInlineSnapshot(`
@@ -160,6 +188,18 @@ describe('InternalPaymentError', () => {
         "type": "https://paymentauth.org/problems/internal-payment-error",
       }
     `)
+    expect('cause' in new InternalPaymentError()).toBe(false)
+  })
+
+  test('keeps cause out of problem details', () => {
+    const cause = new Error('request to https://rpc.example.com/?key=secret-key failed')
+    const error = new InternalPaymentError({ cause })
+
+    expect(error.cause).toBe(cause)
+    expect(error.toProblemDetails('challenge-id')).toEqual(
+      new InternalPaymentError().toProblemDetails('challenge-id'),
+    )
+    expect(JSON.stringify(error.toProblemDetails('challenge-id'))).not.toContain('secret-key')
   })
 })
 

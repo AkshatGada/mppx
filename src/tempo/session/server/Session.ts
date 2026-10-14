@@ -176,16 +176,16 @@ function createBootstrapChallenge(parameters: {
 }
 
 function respondBootstrapChallenge(challenge: Challenge.Challenge, error?: Errors.PaymentError) {
-  const headers = new Headers({
-    [Constants.Headers.wwwAuthenticate]: Challenge.serialize(challenge),
-    'Cache-Control': 'no-store',
-  })
+  const headers = new Headers({ 'Cache-Control': 'no-store' })
+  // A 403 is final: omit the challenge, as `Transport.http()` does.
+  if (error?.status !== 403)
+    headers.set(Constants.Headers.wwwAuthenticate, Challenge.serialize(challenge))
   if (!error) return new Response(null, { status: 402, headers })
   headers.set('Content-Type', 'application/problem+json')
-  return new Response(JSON.stringify(error.toProblemDetails(challenge.id)), {
-    status: error.status,
-    headers,
-  })
+  return new Response(
+    JSON.stringify(error.toProblemDetails(error.status === 403 ? undefined : challenge.id)),
+    { status: error.status, headers },
+  )
 }
 
 function assertBootstrapChallengeMatches(
@@ -290,7 +290,9 @@ async function handleBootstrapPreflight(
   } catch (error) {
     return respondBootstrapChallenge(
       challenge,
-      error instanceof Errors.PaymentError ? error : new Errors.InternalPaymentError(),
+      error instanceof Errors.PaymentError
+        ? error
+        : new Errors.InternalPaymentError({ cause: error }),
     )
   }
 

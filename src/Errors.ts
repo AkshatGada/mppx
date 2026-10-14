@@ -30,6 +30,13 @@ export abstract class PaymentError extends Error {
   protected constructor(message: string, options: PaymentError.Options = {}) {
     super(message)
     this.details = options.details
+    // Defined manually (non-enumerable, like native `cause`) so consumers on pre-ES2022 libs still typecheck.
+    if (options.cause !== undefined)
+      Object.defineProperty(this, 'cause', {
+        configurable: true,
+        value: options.cause,
+        writable: true,
+      })
   }
 
   /** Converts the error to RFC 9457 Problem Details format. */
@@ -48,6 +55,8 @@ export abstract class PaymentError extends Error {
 
 export declare namespace PaymentError {
   type Options = {
+    /** Underlying error. Never serialized into Problem Details. */
+    cause?: unknown
     details?: Record<string, unknown> | undefined
   }
 
@@ -122,7 +131,7 @@ export declare namespace InvalidChallengeError {
  * Payment proof is invalid or verification failed.
  */
 export class VerificationFailedError extends PaymentError {
-  override readonly name = 'VerificationFailedError'
+  override readonly name: string = 'VerificationFailedError'
   readonly title = 'Verification Failed'
   readonly type = 'https://paymentauth.org/problems/verification-failed'
 
@@ -144,7 +153,35 @@ export declare namespace VerificationFailedError {
 }
 
 /**
+ * The payment behind a credential is already used or bound elsewhere: the
+ * credential was consumed by an earlier request, is being settled by a
+ * concurrent one, or its settled transfer is bound to another challenge.
+ *
+ * Answered with 403 and no challenge (the payment was valid, but policy
+ * denies access), since a fresh 402 challenge would invite an auto-paying
+ * client to pay again. The problem type stays `verification-failed`.
+ */
+export class CredentialReplayedError extends VerificationFailedError {
+  override readonly name = 'CredentialReplayedError'
+  override readonly status = 403
+
+  constructor(options: CredentialReplayedError.Options = {}) {
+    const { reason = 'Credential has already been used' } = options
+    super({ reason })
+  }
+}
+
+export declare namespace CredentialReplayedError {
+  type Options = {
+    /** Reason the credential was rejected (e.g., "Transaction hash has already been used"). */
+    reason?: string
+  }
+}
+
+/**
  * Payment processing failed because of an unexpected internal error.
+ *
+ * The response stays generic; the original error is only available on `cause`.
  */
 export class InternalPaymentError extends PaymentError {
   override readonly name = 'InternalPaymentError'
@@ -152,8 +189,15 @@ export class InternalPaymentError extends PaymentError {
   override readonly status = 500
   readonly type = 'https://paymentauth.org/problems/internal-payment-error'
 
-  constructor() {
-    super('An internal payment error occurred.')
+  constructor(options: InternalPaymentError.Options = {}) {
+    super('An internal payment error occurred.', { cause: options.cause })
+  }
+}
+
+export declare namespace InternalPaymentError {
+  type Options = {
+    /** Original error, for server-side hooks and logging. Never sent to clients. */
+    cause?: unknown
   }
 }
 
