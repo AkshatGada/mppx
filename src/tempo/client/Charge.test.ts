@@ -1,4 +1,5 @@
 import { Challenge, Credential } from 'mppx'
+import { Mppx } from 'mppx/client'
 import { type Address, createClient, http, isAddressEqual } from 'viem'
 import { privateKeyToAccount } from 'viem/accounts'
 import { tempoLocalnet } from 'viem/chains'
@@ -14,6 +15,7 @@ const account = privateKeyToAccount(
 )
 const currency = '0x3333333333333333333333333333333333333333'
 const recipient = '0x2222222222222222222222222222222222222222'
+const otherCurrency = '0x4444444444444444444444444444444444444444'
 
 type ChargeRequest = ReturnType<typeof Methods.charge.schema.request.parse>
 
@@ -1181,6 +1183,234 @@ describe('recipient allowlist', () => {
       vi.doUnmock('viem/actions')
       vi.resetModules()
     }
+  })
+})
+
+describe('amount cap', () => {
+  const atomicError = 'Tempo charge amount exceeds maxAtomicAmount.'
+  const displayError = 'Tempo charge amount exceeds maxAmount.'
+  const decimalsError = 'Tempo charge maxAmount requires currency decimals.'
+  const currenciesError = 'Tempo charge maxAmount and maxAtomicAmount require currencies.'
+
+  // The challenge charges 1 token (1_000_000 base units at 6 decimals).
+  test.each([
+    { name: 'atomic below cap', options: { maxAtomicAmount: '1000001' }, error: undefined },
+    { name: 'atomic equal to cap', options: { maxAtomicAmount: '1000000' }, error: undefined },
+    { name: 'atomic above cap', options: { maxAtomicAmount: '999999' }, error: atomicError },
+    { name: 'atomic zero cap', options: { maxAtomicAmount: '0' }, error: atomicError },
+    {
+      name: 'display below cap',
+      options: { decimals: 6, maxAmount: '1.000001' },
+      error: undefined,
+    },
+    { name: 'display equal to cap', options: { decimals: 6, maxAmount: '1' }, error: undefined },
+    {
+      name: 'display above cap',
+      options: { decimals: 6, maxAmount: '0.999999' },
+      error: displayError,
+    },
+    {
+      name: 'atomic cap with passing display cap',
+      options: { decimals: 6, maxAmount: '2', maxAtomicAmount: '999999' },
+      error: atomicError,
+    },
+    { name: 'no cap', options: {}, error: undefined },
+    {
+      name: 'unlisted currency',
+      options: { currencies: [otherCurrency] },
+      error: `Tempo charge currency is not allowed: ${currency}.`,
+    },
+  ])('$name', async ({ options, error }) => {
+    vi.resetModules()
+    const prepareTransactionRequest = vi.fn(async () => ({}))
+    const signTransaction = vi.fn(async () => '0xdeadbeef')
+    vi.doMock('viem/actions', () => ({
+      prepareTransactionRequest,
+      signTransaction,
+      sendCallsSync: vi.fn(),
+      signTypedData: vi.fn(),
+    }))
+    try {
+      const { charge: mockedCharge } = await import('./Charge.js')
+      const client = createClient({
+        account,
+        chain: { ...tempoLocalnet, id: 42431 },
+        transport: http('http://127.0.0.1'),
+      })
+      const resolveAccount = vi.fn(() => account)
+      const method = mockedCharge({
+        account,
+        getClient: () => client,
+        resolveAccount,
+        currencies: [currency],
+        ...(options as charge.Parameters),
+      })
+      const result = method.createCredential({
+        challenge: createChallenge({
+          amount: '1',
+          splits: [{ recipient: currency, amount: '0.4' }],
+          supportedModes: ['pull'],
+        }),
+        context: {},
+      })
+      if (error) {
+        await expect(result).rejects.toThrow(error)
+        expect(resolveAccount).not.toHaveBeenCalled()
+        expect(prepareTransactionRequest).not.toHaveBeenCalled()
+        expect(signTransaction).not.toHaveBeenCalled()
+      } else {
+        expect(Credential.deserialize(await result).payload).toEqual({
+          signature: '0xdeadbeef',
+          type: 'transaction',
+        })
+        expect(signTransaction).toHaveBeenCalledOnce()
+      }
+    } finally {
+      vi.doUnmock('viem/actions')
+      vi.resetModules()
+    }
+  })
+
+  test.each([
+    {
+      name: 'atomic cap without currencies',
+      options: { currencies: undefined, maxAtomicAmount: '1' },
+      error: currenciesError,
+    },
+    {
+      name: 'display cap without currencies',
+      options: { currencies: undefined, decimals: 6, maxAmount: '1' },
+      error: currenciesError,
+    },
+    { name: 'display cap without decimals', options: { maxAmount: '2' }, error: decimalsError },
+    {
+      name: 'display cap finer than decimals',
+      options: { decimals: 6, maxAmount: '1.0000005' },
+      error: 'Tempo charge maxAmount 1.0000005 has more fractional digits than 6 decimals allow.',
+    },
+    {
+      name: 'display cap with trailing zeros',
+      options: { decimals: 6, maxAmount: '1.0000000' },
+      error: undefined,
+    },
+  ])('$name at config time', ({ options, error }) => {
+    const create = () => charge({ account, currencies: [currency], ...options })
+    if (error) expect(create).toThrow(error)
+    else expect(create).not.toThrow()
+  })
+
+  test('accepts zero-amount proofs under a zero cap', async () => {
+    const signer = { ...account }
+    const signTypedData = vi.spyOn(signer, 'signTypedData')
+    const client = createClient({
+      account: signer,
+      chain: { ...tempoLocalnet, id: 42431 },
+      transport: http('http://127.0.0.1'),
+    })
+    const method = charge({
+      account: signer,
+      currencies: [currency],
+      getClient: () => client,
+      maxAtomicAmount: '0',
+    })
+    const credential = await method.createCredential({ challenge: createChallenge(), context: {} })
+    expect(Credential.deserialize(credential).payload).toMatchObject({ type: 'proof' })
+    expect(signTypedData).toHaveBeenCalledOnce()
+  })
+})
+
+describe('challenge selection policy', () => {
+  test.each([
+    {
+      name: 'atomic cap skips an over-cap offer',
+      options: { currencies: [currency], maxAtomicAmount: '1000000' },
+      offers: [{ amount: '2' }, { amount: '0.5' }],
+      selected: 1,
+    },
+    {
+      name: 'atomic cap rejects all over-cap offers',
+      options: { currencies: [currency], maxAtomicAmount: '1000000' },
+      offers: [{ amount: '2' }, { amount: '3' }],
+      selected: undefined,
+    },
+    {
+      name: 'display cap skips an over-cap offer',
+      options: { currencies: [currency], decimals: 6, maxAmount: '1' },
+      offers: [{ amount: '2' }, { amount: '0.5' }],
+      selected: 1,
+    },
+    {
+      name: 'display cap rejects all over-cap offers',
+      options: { currencies: [currency], decimals: 6, maxAmount: '1' },
+      offers: [{ amount: '2' }, { amount: '3' }],
+      selected: undefined,
+    },
+    {
+      name: 'currency allowlist skips a wrong-currency offer',
+      options: { currencies: [currency], maxAtomicAmount: '1000000' },
+      offers: [
+        { amount: '0.5', currency: otherCurrency },
+        { amount: '0.5', currency },
+      ],
+      selected: 1,
+    },
+    {
+      name: 'currency allowlist rejects all wrong-currency offers',
+      options: { currencies: [currency], maxAtomicAmount: '1000000' },
+      offers: [
+        { amount: '0.5', currency: otherCurrency },
+        { amount: '0.5', currency: otherCurrency },
+      ],
+      selected: undefined,
+    },
+    {
+      name: 'recipient allowlist skips a disallowed primary recipient',
+      options: { expectedRecipients: [recipient] },
+      offers: [{ recipient: currency }, { recipient }],
+      selected: 1,
+    },
+    {
+      name: 'recipient allowlist skips a disallowed split recipient',
+      options: { expectedRecipients: [recipient] },
+      offers: [{ amount: '1', splits: [{ recipient: currency, amount: '0.1' }] }, { amount: '1' }],
+      selected: 1,
+    },
+    {
+      name: 'recipient allowlist rejects all disallowed offers',
+      options: { expectedRecipients: [recipient] },
+      offers: [{ recipient: currency }, { recipient: currency }],
+      selected: undefined,
+    },
+    {
+      name: 'chain pin skips a mismatched chain',
+      options: { expectedChainId: 42431 },
+      offers: [{ chainId: 4217 }, { chainId: 42431 }],
+      selected: 1,
+    },
+    {
+      name: 'chain allowlist rejects all disallowed chains',
+      options: { allowedChainIds: [4217] },
+      offers: [{ chainId: 42431 }, { chainId: 1 }],
+      selected: undefined,
+    },
+  ])('$name', async ({ options, offers, selected }) => {
+    const mppx = Mppx.create({
+      methods: [charge({ account, ...(options as charge.Parameters) })],
+      polyfill: false,
+    })
+    const challenges = offers.map((offer, index) => ({
+      ...createChallenge(offer),
+      id: `offer-${index}`,
+    }))
+    const prepared = mppx.preparePayment(
+      new Response(null, {
+        headers: { 'WWW-Authenticate': challenges.map(Challenge.serialize).join(', ') },
+        status: 402,
+      }),
+    )
+    if (selected === undefined)
+      await expect(prepared).rejects.toThrow('No method found for challenges')
+    else expect((await prepared).challenge.id).toBe(`offer-${selected}`)
   })
 })
 

@@ -1,5 +1,5 @@
 import type * as Hex from 'ox/Hex'
-import type { Address } from 'viem'
+import { type Address, parseUnits } from 'viem'
 import {
   prepareTransactionRequest,
   sendCallsSync,
@@ -53,6 +53,17 @@ const chargeContextSchema = z.object({
  */
 export function charge(parameters: charge.Parameters = {}) {
   const { clientId } = parameters
+  // Caps are denominated in the challenge currency, so they require a currency pin.
+  if (
+    (parameters.maxAmount !== undefined || parameters.maxAtomicAmount !== undefined) &&
+    parameters.currencies === undefined
+  )
+    throw new Error('Tempo charge maxAmount and maxAtomicAmount require currencies.')
+  const caps = {
+    maxAmount: parseMaxAmount(parameters.maxAmount, parameters.decimals),
+    maxAtomicAmount:
+      parameters.maxAtomicAmount === undefined ? undefined : BigInt(parameters.maxAtomicAmount),
+  }
   const getClient = Client.getResolver({
     chain: tempo_chain,
     getClient: parameters.getClient,
@@ -61,22 +72,21 @@ export function charge(parameters: charge.Parameters = {}) {
   const getAccount = Account.getResolver({ account: parameters.account })
 
   return Method.toClient(Methods.charge, {
+    // Skip offers that violate client policy so an acceptable offer can be chosen.
+    canHandleChallenge({ challenge }) {
+      try {
+        assertChallengePolicy(parameters, caps, challenge.request as ChargeRequest)
+        return true
+      } catch {
+        return false
+      }
+    },
     context: chargeContextSchema,
 
     async createCredential({ challenge, context }) {
-      // Chain pinning: reject a challenge whose chain ID conflicts with the
-      // pinned one, and sign on the pin when the challenge omits a chain ID.
+      assertChallengePolicy(parameters, caps, challenge.request)
+      // Sign on the pinned chain when the challenge omits a chain ID.
       const challengeChainId = challenge.request.methodDetails?.chainId
-      if (
-        parameters.expectedChainId !== undefined &&
-        challengeChainId !== undefined &&
-        challengeChainId !== parameters.expectedChainId
-      )
-        throw new Error(
-          `Chain ID mismatch: expected ${parameters.expectedChainId}, got ${challengeChainId}.`,
-        )
-      if (challengeChainId !== undefined || parameters.allowedChainIds?.length === 0)
-        Client.assertAllowedChainId(parameters.allowedChainIds, challengeChainId)
       const resolvedChainId =
         challengeChainId ??
         parameters.expectedChainId ??
@@ -100,19 +110,6 @@ export function charge(parameters: charge.Parameters = {}) {
           chainId,
           operation,
         })) ?? defaultAccount
-
-      if (parameters.expectedRecipients) {
-        const allowed = new Set(parameters.expectedRecipients.map((a) => a.toLowerCase()))
-        if (!request.recipient || !allowed.has(request.recipient.toLowerCase()))
-          throw new Error(`Unexpected primary recipient: ${request.recipient}`)
-        const splits = methodDetails?.splits as readonly { recipient: string }[] | undefined
-        if (splits) {
-          for (const split of splits) {
-            if (!allowed.has(split.recipient.toLowerCase()))
-              throw new Error(`Unexpected split recipient: ${split.recipient}`)
-          }
-        }
-      }
 
       // Zero-amount: sign EIP-712 typed data instead of creating a transaction.
       if (BigInt(amount) === 0n) {
@@ -301,6 +298,70 @@ export function charge(parameters: charge.Parameters = {}) {
   })
 }
 
+/** Parses `maxAmount` to base units, rejecting values that cannot be represented exactly. */
+function parseMaxAmount(maxAmount: string | undefined, decimals: number | undefined) {
+  if (maxAmount === undefined) return undefined
+  if (decimals === undefined) throw new Error('Tempo charge maxAmount requires currency decimals.')
+  // `parseUnits` rounds excess fractional digits, which could loosen the cap.
+  const fraction = maxAmount.split('.')[1]?.replace(/0+$/, '') ?? ''
+  if (fraction.length > decimals)
+    throw new Error(
+      `Tempo charge maxAmount ${maxAmount} has more fractional digits than ${decimals} decimals allow.`,
+    )
+  return parseUnits(maxAmount, decimals)
+}
+
+type ChargeRequest = z.output<typeof Methods.charge.schema.request>
+
+/**
+ * Rejects a challenge whose chain, currency, recipients, or amount violate the client policy.
+ * Runs during challenge selection and again before any client, account, or signing work.
+ */
+function assertChallengePolicy(
+  parameters: charge.Parameters,
+  caps: { maxAmount: bigint | undefined; maxAtomicAmount: bigint | undefined },
+  request: ChargeRequest,
+) {
+  const { amount, methodDetails, recipient } = request
+
+  // Chain pinning: reject a challenge whose chain ID conflicts with the pinned one.
+  const challengeChainId = methodDetails?.chainId
+  if (
+    parameters.expectedChainId !== undefined &&
+    challengeChainId !== undefined &&
+    challengeChainId !== parameters.expectedChainId
+  )
+    throw new Error(
+      `Chain ID mismatch: expected ${parameters.expectedChainId}, got ${challengeChainId}.`,
+    )
+  if (challengeChainId !== undefined || parameters.allowedChainIds?.length === 0)
+    Client.assertAllowedChainId(parameters.allowedChainIds, challengeChainId)
+
+  if (
+    parameters.currencies &&
+    !parameters.currencies.some((c) => c.toLowerCase() === request.currency.toLowerCase())
+  )
+    throw new Error(`Tempo charge currency is not allowed: ${request.currency}.`)
+
+  if (parameters.expectedRecipients) {
+    const allowed = new Set(parameters.expectedRecipients.map((a) => a.toLowerCase()))
+    if (!recipient || !allowed.has(recipient.toLowerCase()))
+      throw new Error(`Unexpected primary recipient: ${recipient}`)
+    const splits = methodDetails?.splits as readonly { recipient: string }[] | undefined
+    if (splits) {
+      for (const split of splits) {
+        if (!allowed.has(split.recipient.toLowerCase()))
+          throw new Error(`Unexpected split recipient: ${split.recipient}`)
+      }
+    }
+  }
+
+  if (caps.maxAtomicAmount !== undefined && BigInt(amount) > caps.maxAtomicAmount)
+    throw new Error('Tempo charge amount exceeds maxAtomicAmount.')
+  if (caps.maxAmount !== undefined && BigInt(amount) > caps.maxAmount)
+    throw new Error('Tempo charge amount exceeds maxAmount.')
+}
+
 export declare namespace charge {
   type AutoSwap = AutoSwap.resolve.Value
   type Context = ChargeContext
@@ -334,6 +395,33 @@ export declare namespace charge {
      * recipient and every split recipient must be included in this list.
      */
     expectedRecipients?: readonly Address[] | undefined
+    /**
+     * Allowlist of TIP-20 currency addresses this client will pay in, compared
+     * case-insensitively. Offers in other currencies are skipped during selection
+     * and rejected before signing; an empty list rejects all. Required with
+     * `maxAmount` or `maxAtomicAmount`, which are denominated in the challenge currency.
+     */
+    currencies?: readonly Address[] | undefined
+    /**
+     * Decimals of the `currencies`, used to parse `maxAmount`. Required with
+     * `maxAmount` because challenges do not carry currency decimals.
+     */
+    decimals?: number | undefined
+    /**
+     * Maximum display-unit amount (e.g. `'1.5'`) the client is willing to pay per
+     * charge, parsed with `decimals`. Values with more fractional digits than
+     * `decimals` are rejected rather than rounded. Compared against the challenge
+     * amount, which includes splits; larger offers are skipped during selection and
+     * rejected before signing. Applies per credential, not cumulatively across
+     * payment retries. Requires `currencies`.
+     */
+    maxAmount?: string | undefined
+    /**
+     * Maximum amount the client is willing to pay per charge, in raw base units of
+     * the challenge currency (compared directly with the challenge `amount`).
+     * Checked like `maxAmount`. Requires `currencies`.
+     */
+    maxAtomicAmount?: string | undefined
     /**
      * Controls how the charge transaction is submitted.
      *
