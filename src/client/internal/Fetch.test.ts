@@ -1465,6 +1465,321 @@ describe('Fetch.from: 402 retry path', () => {
     expect(events).toEqual([])
   })
 
+  test.each([
+    [200, ['payment.response']],
+    [201, ['payment.response']],
+    [400, []],
+    [403, []],
+    [404, []],
+    [500, ['payment.failed']],
+    [502, ['payment.failed']],
+    [503, ['payment.failed']],
+  ])('reports a %i paid retry as %j without retrying', async (status, expected) => {
+    const method = MethodResponse.registerTransactionHash(
+      { ...noopMethod },
+      (credential) => `hash:${credential}`,
+    )
+    const mockFetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) =>
+      new Headers(init?.headers).has('Authorization') ? new Response(null, { status }) : make402(),
+    )
+    const events: string[] = []
+    const failures: Fetch.PaymentFailedPayload<[typeof method]>[] = []
+    const eventDispatcher = Fetch.createEventDispatcher<[typeof method]>()
+    eventDispatcher.on('*', (event) => {
+      if (event.name.startsWith('payment.')) events.push(event.name)
+    })
+    eventDispatcher.on('payment.failed', (payload) => {
+      failures.push(payload)
+    })
+    const fetch = Fetch.from({
+      eventDispatcher,
+      fetch: mockFetch as typeof globalThis.fetch,
+      methods: [method],
+    })
+
+    const response = await fetch('https://example.com/api')
+
+    expect(response.status).toBe(status)
+    expect(mockFetch).toHaveBeenCalledTimes(2)
+    expect(events).toEqual(expected)
+    for (const failure of failures) {
+      expect(failure.error).toBeInstanceOf(Errors.PaymentOutcomeUnknownError)
+      expect(failure.error).toMatchObject({
+        challenge: { id: 'abc' },
+        credential: 'credential',
+        transactionHash: 'hash:credential',
+      })
+      expect(failure.response?.status).toBe(status)
+    }
+  })
+
+  test('does not report a 403 credential replay as an unknown outcome', async () => {
+    const replayed = new Errors.CredentialReplayedError()
+    const events: string[] = []
+    const eventDispatcher = Fetch.createEventDispatcher()
+    eventDispatcher.on('*', (event) => {
+      events.push(event.name)
+    })
+    const fetch = Fetch.from({
+      eventDispatcher,
+      fetch: async (_input, init) =>
+        new Headers(init?.headers).has('Authorization')
+          ? Response.json(replayed.toProblemDetails(), { status: replayed.status })
+          : make402(),
+      methods: [noopMethod],
+    })
+
+    const response = await fetch('https://example.com/api')
+
+    expect(response.status).toBe(403)
+    expect(response.headers.has('WWW-Authenticate')).toBe(false)
+    expect(await response.json()).toMatchObject({ status: 403 })
+    expect(events).toEqual(['challenge.received', 'credential.created'])
+  })
+
+  test.each([
+    ['is not registered', (method: object) => method],
+    [
+      'throws',
+      (method: object) =>
+        MethodResponse.registerTransactionHash(method as never, () => {
+          throw new Error('malformed')
+        }),
+    ],
+  ])('reports a 5xx paid retry when hash derivation %s', async (_name, register) => {
+    const method = register({ ...noopMethod }) as typeof noopMethod
+    let calls = 0
+    const failures: unknown[] = []
+    const eventDispatcher = Fetch.createEventDispatcher<[typeof method]>()
+    eventDispatcher.on('payment.failed', (payload) => {
+      failures.push(payload.error)
+    })
+    const fetch = Fetch.from({
+      eventDispatcher,
+      fetch: async () => (++calls === 1 ? make402() : new Response(null, { status: 500 })),
+      methods: [method],
+    })
+
+    expect((await fetch('https://example.com/api')).status).toBe(500)
+    expect(failures).toEqual([expect.any(Errors.PaymentOutcomeUnknownError)])
+    expect(failures[0]).toMatchObject({ credential: 'credential', transactionHash: undefined })
+  })
+
+  test.each([
+    ['a network error', new TypeError('fetch failed')],
+    ['an abort', new DOMException('The operation was aborted.', 'AbortError')],
+  ])('reports %s on the paid retry and rethrows it', async (_name, cause) => {
+    const method = MethodResponse.registerTransactionHash(
+      { ...noopMethod },
+      (credential) => `hash:${credential}`,
+    )
+    let calls = 0
+    const failures: unknown[] = []
+    const eventDispatcher = Fetch.createEventDispatcher<[typeof method]>()
+    eventDispatcher.on('payment.failed', (payload) => {
+      failures.push(payload.error)
+    })
+    const fetch = Fetch.from({
+      eventDispatcher,
+      fetch: async () => {
+        if (++calls === 1) return make402()
+        throw cause
+      },
+      methods: [method],
+    })
+
+    await expect(fetch('https://example.com/api')).rejects.toBe(cause)
+    expect(calls).toBe(2)
+    expect(failures).toEqual([expect.any(Errors.PaymentOutcomeUnknownError)])
+    expect(failures[0]).toMatchObject({
+      cause,
+      challenge: { id: 'abc' },
+      credential: 'credential',
+      transactionHash: 'hash:credential',
+    })
+  })
+
+  test.each([
+    ['a complete body', ['settle failed'], true, 'settle failed', false],
+    ['a large body', ['x'.repeat(40_000), 'x'.repeat(40_000)], false, 'x'.repeat(64 * 1024), true],
+    ['a slow body', ['partial'], false, 'partial', true],
+  ])(
+    'buffers %s within bounds before payment.failed observers',
+    async (_name, chunks, complete, expected, truncated) => {
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+      try {
+        let cancelled = false
+        const failures: Fetch.PaymentFailedPayload[] = []
+        const eventDispatcher = Fetch.createEventDispatcher()
+        eventDispatcher.on('payment.failed', (payload) => {
+          failures.push(payload)
+        })
+        const body = new ReadableStream<Uint8Array>({
+          start(controller) {
+            for (const chunk of chunks) controller.enqueue(new TextEncoder().encode(chunk))
+            if (complete) controller.close()
+          },
+          cancel() {
+            cancelled = true
+          },
+        })
+        const fetch = Fetch.from({
+          eventDispatcher,
+          fetch: async (_input, init) =>
+            new Headers(init?.headers).has('Authorization')
+              ? new Response(body, { headers: { 'Content-Length': '100000' }, status: 500 })
+              : make402(),
+          methods: [noopMethod],
+        })
+
+        const result = fetch('https://example.com/api')
+        await vi.advanceTimersByTimeAsync(2_000)
+        const response = await result
+
+        expect(await response.text()).toBe(expected)
+        expect(response.headers.get('Mppx-Body-Truncated')).toBe(truncated ? 'true' : null)
+        expect(response.headers.has('Content-Length')).toBe(!truncated)
+        expect(cancelled).toBe(!complete)
+        expect(failures).toHaveLength(1)
+        expect(await failures[0]!.response?.text()).toBe(expected)
+      } finally {
+        vi.useRealTimers()
+      }
+    },
+  )
+
+  test.each([
+    ['fully buffered', 'settle failed', false],
+    ['truncated', 'x'.repeat(100_000), true],
+  ])('keeps the observable fields of a %s 5xx response', async (_name, body, truncated) => {
+    const httpServer = await Http.createServer((req, res) => {
+      if (!req.headers.authorization) {
+        res.writeHead(402, { 'WWW-Authenticate': make402().headers.get('WWW-Authenticate')! })
+        res.end()
+        return
+      }
+      res.writeHead(500, 'Settlement Failed', {
+        'Content-Type': 'text/plain',
+        'X-Request-Id': 'abc',
+      })
+      res.end(body)
+    })
+    try {
+      let original: Response | undefined
+      const eventDispatcher = Fetch.createEventDispatcher()
+      eventDispatcher.on('payment.failed', () => {})
+      const fetch = Fetch.from({
+        eventDispatcher,
+        fetch: async (input, init) => {
+          const response = await globalThis.fetch(input, init)
+          if (new Headers(init?.headers).has('Authorization')) original = response
+          return response
+        },
+        methods: [noopMethod],
+      })
+
+      const response = await fetch(`${httpServer.url}/paid`)
+
+      expect(original).toBeDefined()
+      expect(response === original).toBe(!truncated)
+      expect({
+        redirected: response.redirected,
+        status: response.status,
+        statusText: response.statusText,
+        type: response.type,
+        url: response.url,
+      }).toEqual({
+        redirected: original!.redirected,
+        status: original!.status,
+        statusText: original!.statusText,
+        type: original!.type,
+        url: original!.url,
+      })
+      const expectedHeaders = new Headers(original!.headers)
+      if (truncated) {
+        expectedHeaders.delete('content-length')
+        expectedHeaders.set('Mppx-Body-Truncated', 'true')
+      }
+      expect(Object.fromEntries(response.headers)).toEqual(Object.fromEntries(expectedHeaders))
+      expect(await response.text()).toBe(truncated ? body.slice(0, 64 * 1024) : body)
+    } finally {
+      httpServer.close()
+    }
+  })
+
+  test('reports a 5xx body read failure and rethrows it', async () => {
+    const cause = new TypeError('terminated')
+    const failures: unknown[] = []
+    const eventDispatcher = Fetch.createEventDispatcher()
+    eventDispatcher.on('payment.failed', (payload) => {
+      failures.push(payload.error)
+    })
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.error(cause)
+      },
+    })
+    const fetch = Fetch.from({
+      eventDispatcher,
+      fetch: async (_input, init) =>
+        new Headers(init?.headers).has('Authorization')
+          ? new Response(body, { status: 500 })
+          : make402(),
+      methods: [noopMethod],
+    })
+
+    await expect(fetch('https://example.com/api')).rejects.toBe(cause)
+    expect(failures).toEqual([expect.any(Errors.PaymentOutcomeUnknownError)])
+    expect(failures[0]).toMatchObject({ cause, credential: 'credential' })
+  })
+
+  test('releases a held 5xx connection before observers reconcile through it', async () => {
+    // One-connection pool: a response holds the connection until its body is cancelled.
+    let held = false
+    const waiters: (() => void)[] = []
+    const release = () => {
+      held = false
+      waiters.shift()?.()
+    }
+    const pooledFetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+      while (held) await new Promise<void>((resolve) => waiters.push(resolve))
+      held = true
+      if (input.toString().endsWith('/reconcile')) {
+        release()
+        return new Response('reconciled')
+      }
+      if (!new Headers(init?.headers).has('Authorization')) {
+        release()
+        return make402()
+      }
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new Uint8Array(100_000))
+          },
+          cancel: release,
+        }),
+        { status: 500 },
+      )
+    }
+    const reconciled: string[] = []
+    const eventDispatcher = Fetch.createEventDispatcher()
+    const fetch = Fetch.from({
+      eventDispatcher,
+      fetch: pooledFetch as typeof globalThis.fetch,
+      methods: [noopMethod],
+    })
+    eventDispatcher.on('payment.failed', async () => {
+      reconciled.push(await (await fetch('https://example.com/reconcile')).text())
+    })
+
+    const response = await fetch('https://example.com/paid')
+
+    expect(response.status).toBe(500)
+    expect(response.headers.get('Mppx-Body-Truncated')).toBe('true')
+    expect(reconciled).toEqual(['reconciled'])
+  })
+
   test('ignores empty challenge event credentials and continues handlers', async () => {
     const createCredential = vi.fn(async () => 'method-credential')
     const method = { ...noopMethod, createCredential }

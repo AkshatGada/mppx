@@ -1,5 +1,6 @@
 import * as Challenge from '../../Challenge.js'
 import * as Constants from '../../Constants.js'
+import { PaymentOutcomeUnknownError } from '../../Errors.js'
 import * as Expires from '../../Expires.js'
 import * as AcceptPayment from '../../internal/AcceptPayment.js'
 import type { MaybePromise } from '../../internal/types.js'
@@ -14,6 +15,10 @@ import * as MethodResponse from './MethodResponse.js'
 // an unrelated fetch installed by user code or another library.
 const MPPX_FETCH_WRAPPER = Symbol.for('mppx.fetch.wrapper')
 const defaultMaxPaymentRetries = 3
+const maxErrorBodyBytes = 64 * 1024
+const errorBodyTimeoutMs = 2_000
+/** Response header set when a paid-retry error body was cut off by {@link bufferErrorBody}. */
+const bodyTruncatedHeader = 'Mppx-Body-Truncated'
 
 type WrappedFetch = typeof globalThis.fetch & {
   [MPPX_FETCH_WRAPPER]?: typeof globalThis.fetch
@@ -33,6 +38,55 @@ type PreparedCredential = {
 
 let originalFetch: typeof globalThis.fetch | undefined
 const eventObserverChecks = new WeakMap<object, (name: keyof ClientEventMap) => boolean>()
+
+/**
+ * Buffers a paid-retry error body within a size and time bound so its connection is
+ * released. A complete body stays in the original response. The body is diagnostic
+ * only: one larger than 64 KiB, or still arriving after 2 seconds, is cancelled and
+ * replaced with what arrived, marked with an `Mppx-Body-Truncated: true` header.
+ */
+async function bufferErrorBody(response: Response): Promise<Response> {
+  if (!response.body) return response
+  // Reading a clone pulls the shared source, buffering it in the original response.
+  const reader = response.clone().body!.getReader()
+  const chunks: Uint8Array<ArrayBuffer>[] = []
+  let received = 0
+  let truncated = false
+  const timeout = setTimeout(() => {
+    truncated = true
+    void reader.cancel().catch(() => {})
+  }, errorBodyTimeoutMs)
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      chunks.push(value)
+      received += value.byteLength
+      if (received > maxErrorBodyBytes) {
+        truncated = true
+        break
+      }
+    }
+  } finally {
+    clearTimeout(timeout)
+    // A tee's cancellation can wait for the other branch; do not await it.
+    void reader.cancel().catch(() => {})
+  }
+  if (!truncated) return response
+  // Cancelling both branches cancels the source and releases the connection.
+  void response.body.cancel().catch(() => {})
+  const headers = new Headers(response.headers)
+  headers.delete('content-length')
+  headers.set(bodyTruncatedHeader, 'true')
+  const truncatedResponse = new Response(new Blob(chunks).slice(0, maxErrorBodyBytes), {
+    headers,
+    status: response.status,
+    statusText: response.statusText,
+  })
+  for (const key of ['redirected', 'type', 'url'] as const)
+    Object.defineProperty(truncatedResponse, key, { value: response[key] })
+  return truncatedResponse
+}
 
 async function settleAttempt(
   prepared: PreparedCredential | undefined,
@@ -235,6 +289,8 @@ export function from<const methods extends readonly Method.AnyClient[]>(
     let challenges: readonly Challenge.Challenge[] | undefined
     let mi: methods[number] | undefined
     let preparedCredential: PreparedCredential | undefined
+    // Set when the paid request throws after the credential was sent.
+    let outcomeUnknown: PaymentOutcomeUnknownError | undefined
 
     try {
       for (let retry = 0; retry < maxPaymentRetries; retry++) {
@@ -364,18 +420,30 @@ export function from<const methods extends readonly Method.AnyClient[]>(
           }),
         )
 
-        response = await baseFetch(paymentInput, {
-          ...transport.setCredential(
-            {
-              ...fetchInit,
-              headers: initialRequest.headers,
-            },
+        const unknownOutcome = (cause?: unknown) =>
+          new PaymentOutcomeUnknownError({
+            cause,
+            challenge: selectedChallenge,
             credential,
-            { challenge: selectedChallenge },
-          ),
-          // Runtimes do not strip custom payment headers on cross-origin redirects.
-          redirect: 'manual',
-        })
+            transactionHash: MethodResponse.getTransactionHash(selected.method, credential),
+          })
+        try {
+          response = await baseFetch(paymentInput, {
+            ...transport.setCredential(
+              {
+                ...fetchInit,
+                headers: initialRequest.headers,
+              },
+              credential,
+              { challenge: selectedChallenge },
+            ),
+            // Runtimes do not strip custom payment headers on cross-origin redirects.
+            redirect: 'manual',
+          })
+        } catch (cause) {
+          outcomeUnknown = unknownOutcome(cause)
+          throw cause
+        }
         const paymentRequired = await transport.isPaymentRequired(
           response,
           transportRequest as never,
@@ -407,6 +475,35 @@ export function from<const methods extends readonly Method.AnyClient[]>(
             }),
           )
         if (!paymentRequired) {
+          // The server may have settled before failing: report the credential for
+          // reconciliation and return the response. Retrying could pay twice.
+          if (response.status >= 500 && hasEventObservers(events, 'payment.failed')) {
+            try {
+              // Release the connection before observers can make requests through it.
+              response = await bufferErrorBody(response)
+            } catch (cause) {
+              outcomeUnknown = unknownOutcome(cause)
+              // The failed body cannot be cloned for observers; keep its status and headers.
+              response = new Response(null, {
+                headers: response.headers,
+                status: response.status,
+                statusText: response.statusText,
+              })
+              throw cause
+            }
+            await events.emit(
+              'payment.failed',
+              createPaymentFailedPayload({
+                challenge: selectedChallenge,
+                challenges,
+                error: unknownOutcome(),
+                init,
+                input,
+                method: selected.method,
+                response,
+              }),
+            )
+          }
           if (!response.ok) return response
           return MethodResponse.handle(selected.method, {
             challenge: selectedChallenge,
@@ -445,7 +542,8 @@ export function from<const methods extends readonly Method.AnyClient[]>(
         createPaymentFailedPayload({
           challenge,
           challenges,
-          error,
+          // Observers get the credential to reconcile; callers keep the original error.
+          error: outcomeUnknown ?? error,
           init,
           input,
           method: mi,
