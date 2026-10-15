@@ -256,7 +256,7 @@ describe('HttpManagement', () => {
     test('postTopUp forwards cancellation to the management request', async () => {
       const controller = new AbortController()
       const fetch = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
-        expect(init?.signal).toBe(controller.signal)
+        expect(init?.signal?.aborted).toBe(false)
         return new Promise<Response>((_resolve, reject) => {
           init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), {
             once: true,
@@ -278,6 +278,41 @@ describe('HttpManagement', () => {
       controller.abort(new Error('cancelled'))
 
       await expect(pending).rejects.toThrow('cancelled')
+    })
+
+    test('times out a stalled management POST and ignores a late 402', async () => {
+      vi.useFakeTimers()
+      try {
+        let finish!: (response: Response) => void
+        let signal: AbortSignal | null | undefined
+        const fetch = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+          signal = init?.signal
+          return new Promise<Response>((resolve) => {
+            finish = resolve
+          })
+        })
+        const createSessionCredential = vi.fn(async () => 'top-up-credential')
+        const pending = postTopUp({
+          additionalDeposit: 3n,
+          challenge: challenge(),
+          channel: channel(),
+          channelId,
+          createSessionCredential,
+          fetch,
+          input: 'https://example.test/resource',
+        })
+        const rejected = expect(pending).rejects.toThrow('payment outcome unknown')
+        await vi.advanceTimersByTimeAsync(30_000)
+        await rejected
+        expect(signal?.aborted).toBe(true)
+        finish(new Response(null, { status: 402 }))
+        await vi.advanceTimersByTimeAsync(0)
+        expect(fetch).toHaveBeenCalledOnce()
+        expect(createSessionCredential).toHaveBeenCalledOnce()
+        expect(vi.getTimerCount()).toBe(0)
+      } finally {
+        vi.useRealTimers()
+      }
     })
 
     test('retryHttpPaymentRequired signs the server-required cumulative voucher', async () => {
@@ -994,89 +1029,104 @@ describe('SseDriver', () => {
     expect(doFetch).toHaveBeenCalledOnce()
   })
 
-  test('keeps voucher events bound to the challenge that opened the stream', async () => {
-    const channelId = `0x${'01'.repeat(32)}` as Hex.Hex
-    const token = '0x20c0000000000000000000000000000000000001' as Address
-    const payee = '0x0000000000000000000000000000000000000002' as Address
-    const descriptor: ChannelDescriptor = {
-      authorizedSigner: '0x0000000000000000000000000000000000000001',
-      expiringNonceHash: `0x${'03'.repeat(32)}` as Hex.Hex,
-      operator: '0x0000000000000000000000000000000000000000',
-      payee,
-      payer: '0x0000000000000000000000000000000000000001',
-      salt: `0x${'02'.repeat(32)}` as Hex.Hex,
-      token,
-    }
-    const makeChallenge = (id: string) =>
-      Challenge.from({
-        id,
-        intent: Constants.Intents.session,
-        method: Constants.Methods.tempo,
-        realm: 'example.test',
-        request: {
-          amount: '1',
-          currency: token,
-          methodDetails: { chainId: 4217, escrowContract: tip20ChannelEscrow },
-          recipient: payee,
-          unitType: 'request',
-        },
-      }) as TempoSessionChallenge
-    const streamChallenge = makeChallenge('challenge-1')
-    let currentChallenge = streamChallenge
-    const controller = new AbortController()
-    const createSessionCredential = vi.fn(async () => 'Payment credential')
-    const fetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
-      expect(init?.signal).toBe(controller.signal)
-      return new Response(null, { status: 204 })
-    })
-    const channel: ChannelEntry = {
-      chainId: 4217,
-      channelId,
-      cumulativeAmount: 1n,
-      deposit: 10n,
-      descriptor,
-      escrow: tip20ChannelEscrow,
-      opened: true,
-    }
-    const response = new Response(
-      formatNeedVoucherEvent({
-        acceptedCumulative: '1',
+  test.each([false, true])(
+    'keeps SSE voucher challenge binding and cancellation (abort %s)',
+    async (cancel) => {
+      const channelId = `0x${'01'.repeat(32)}` as Hex.Hex
+      const token = '0x20c0000000000000000000000000000000000001' as Address
+      const payee = '0x0000000000000000000000000000000000000002' as Address
+      const descriptor: ChannelDescriptor = {
+        authorizedSigner: '0x0000000000000000000000000000000000000001',
+        expiringNonceHash: `0x${'03'.repeat(32)}` as Hex.Hex,
+        operator: '0x0000000000000000000000000000000000000000',
+        payee,
+        payer: '0x0000000000000000000000000000000000000001',
+        salt: `0x${'02'.repeat(32)}` as Hex.Hex,
+        token,
+      }
+      const makeChallenge = (id: string) =>
+        Challenge.from({
+          id,
+          intent: Constants.Intents.session,
+          method: Constants.Methods.tempo,
+          realm: 'example.test',
+          request: {
+            amount: '1',
+            currency: token,
+            methodDetails: { chainId: 4217, escrowContract: tip20ChannelEscrow },
+            recipient: payee,
+            unitType: 'request',
+          },
+        }) as TempoSessionChallenge
+      const streamChallenge = makeChallenge('challenge-1')
+      let currentChallenge = streamChallenge
+      const controller = new AbortController()
+      const createSessionCredential = vi.fn(async () => 'Payment credential')
+      let postedSignal: AbortSignal | null | undefined
+      const fetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+        postedSignal = init?.signal
+        expect(postedSignal?.aborted).toBe(false)
+        if (cancel) return new Promise<Response>(() => {})
+        return new Response(null, { status: 204 })
+      })
+      const channel: ChannelEntry = {
+        chainId: 4217,
         channelId,
-        deposit: '10',
-        requiredCumulative: '2',
-      }),
-      { headers: { 'Content-Type': 'text/event-stream' } },
-    )
-    const stream = consumeSseSessionResponse(
-      'https://example.test/stream',
-      response,
-      { signal: controller.signal },
-      {
-        acceptReceipt() {},
-        assertVoucherWithinLocalLimit() {},
-        createSessionCredential,
-        async doFetch() {
-          throw new Error('unexpected resource fetch')
+        cumulativeAmount: 1n,
+        deposit: 10n,
+        descriptor,
+        escrow: tip20ChannelEscrow,
+        opened: true,
+      }
+      const response = new Response(
+        formatNeedVoucherEvent({
+          acceptedCumulative: '1',
+          channelId,
+          deposit: '10',
+          requiredCumulative: '2',
+        }),
+        { headers: { 'Content-Type': 'text/event-stream' } },
+      )
+      const stream = consumeSseSessionResponse(
+        'https://example.test/stream',
+        response,
+        { signal: controller.signal },
+        {
+          acceptReceipt() {},
+          assertVoucherWithinLocalLimit() {},
+          createSessionCredential,
+          async doFetch() {
+            throw new Error('unexpected resource fetch')
+          },
+          fetch,
+          getChallenge: () => currentChallenge,
+          getChannel: () => channel,
+          async topUpIfNeeded() {},
         },
-        fetch,
-        getChallenge: () => currentChallenge,
-        getChannel: () => channel,
-        async topUpIfNeeded() {},
-      },
-    )
+      )
 
-    currentChallenge = makeChallenge('challenge-2')
-    const frames: string[] = []
-    for await (const frame of stream) frames.push(frame)
+      currentChallenge = makeChallenge('challenge-2')
+      const frames: string[] = []
+      const consume = (async () => {
+        for await (const frame of stream) frames.push(frame)
+      })()
+      if (cancel) {
+        const rejected = expect(consume).rejects.toThrow('cancel SSE voucher')
+        await vi.waitFor(() => expect(fetch).toHaveBeenCalledOnce())
+        controller.abort(new Error('cancel SSE voucher'))
+        await rejected
+        expect(postedSignal?.aborted).toBe(true)
+      } else await consume
 
-    expect(frames).toEqual([])
-    expect(fetch).toHaveBeenCalledOnce()
-    expect(createSessionCredential).toHaveBeenCalledOnce()
-    expect(createSessionCredential).toHaveBeenCalledWith(
-      streamChallenge,
-      expect.objectContaining({ action: 'voucher', cumulativeAmountRaw: '2' }),
-    )
-  })
+      expect(frames).toEqual([])
+      expect(fetch).toHaveBeenCalledOnce()
+      expect(createSessionCredential).toHaveBeenCalledOnce()
+      expect(createSessionCredential).toHaveBeenCalledWith(
+        streamChallenge,
+        expect.objectContaining({ action: 'voucher', cumulativeAmountRaw: '2' }),
+      )
+    },
+  )
 })
 
 describe('WsDriver', () => {

@@ -12,7 +12,15 @@ import * as Client from '../../../viem/Client.js'
 import { charge as chargePlugin } from '../../client/Charge.js'
 import * as defaults from '../../internal/defaults.js'
 import type { ChannelEntry } from '../client/ChannelOps.js'
-import { createChannelStore, entryKey, type ChannelStore } from '../client/ChannelStore.js'
+import {
+  createChannelStore,
+  deleteChannel,
+  entryKey,
+  persistChannel as persistStoredChannel,
+  registerFundingStore,
+  withFundingLock,
+  type ChannelStore,
+} from '../client/ChannelStore.js'
 import {
   hydrateSessionSnapshot,
   sessionContextSchema,
@@ -58,7 +66,12 @@ import {
   WebSocketReadyState,
 } from './Transports.js'
 import { consumeSseSessionResponse, openSseSession, type SseDriverOptions } from './Transports.js'
-import { applyTopUpResult, resolveManualTopUp, type TopUpRequirement } from './Transports.js'
+import {
+  UncertainFundingError,
+  applyTopUpResult,
+  resolveManualTopUp,
+  type TopUpRequirement,
+} from './Transports.js'
 import {
   openWebSocketSession,
   prepareWebSocketSession,
@@ -244,6 +257,8 @@ export function sessionManager(parameters: sessionManager.Parameters): SessionMa
     return undefined
   }
 
+  const persistChannel = (entry: ChannelEntry) => persistStoredChannel(backing, entry)
+
   const store: ChannelStore = {
     async get(key) {
       const entry = await getReusable(key)
@@ -258,26 +273,41 @@ export function sessionManager(parameters: sessionManager.Parameters): SessionMa
       if (entry.opened) ignoredChannelIds.delete(entry.channelId)
       if (channelUse?.trackCreates && !channelUse.seenExisting.has(key))
         channelUse.created.set(key, entry)
-      await backing.set(entry)
+      await persistChannel(entry)
     },
-    delete: (key) => backing.delete(key),
+    delete: (key) => deleteChannel(backing, key),
   }
+
+  registerFundingStore(store, backing)
 
   /** Removes a failed channel from candidacy for the rest of this manager's life. */
   async function ignoreChannel(entry: ChannelEntry) {
     const key = entryKey(entry)
+    const current = await backing.get(key)
+    if (entry.uncertainTopUp || current?.uncertainTopUp)
+      throw new Error(
+        'Session funding outcome is unknown; reconcile the pending payment before replacing the channel.',
+      )
     ignoredChannelIds.add(entry.channelId)
     channelUse?.seenExisting.delete(key)
     if (channelUse?.resumed === entry) channelUse.resumed = undefined
-    await Promise.resolve(backing.delete(key)).catch(() => undefined)
+    await Promise.resolve(deleteChannel(backing, key)).catch(() => undefined)
   }
 
   async function rollbackCreatedChannels() {
     const use = channelUse
     if (!use?.created.size) return
     for (const [key, entry] of use.created) {
+      const current = await backing.get(key)
+      if (
+        entry.uncertainTopUp ||
+        (current?.channelId === entry.channelId && current.uncertainTopUp)
+      )
+        throw new Error(
+          'Session funding outcome is unknown; reconcile the pending payment before discarding the channel.',
+        )
       ignoredChannelIds.add(entry.channelId)
-      await Promise.resolve(backing.delete(key)).catch(() => undefined)
+      await Promise.resolve(deleteChannel(backing, key)).catch(() => undefined)
     }
     use.created.clear()
     await restoreRuntime(use.committed ?? use.previous)
@@ -327,7 +357,7 @@ export function sessionManager(parameters: sessionManager.Parameters): SessionMa
     if (
       !use ||
       baseline?.channelId.toLowerCase() !== entry.channelId.toLowerCase() ||
-      entry.deposit <= baseline.deposit
+      (entry.deposit <= baseline.deposit && !entry.uncertainTopUp)
     )
       return
     use.resumed = undefined
@@ -594,10 +624,12 @@ export function sessionManager(parameters: sessionManager.Parameters): SessionMa
   }
 
   let pendingTopUp: Promise<unknown> | undefined
+  let uncertainFunding: Error | undefined
 
   // Keep funding decisions and their deposit updates atomic within this manager.
   // Waiters share failures instead of immediately retrying an uncertain payment.
   async function withTopUpLock<T>(operation: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+    if (uncertainFunding) throw uncertainFunding
     for (;;) {
       const pending = pendingTopUp
       if (!pending) break
@@ -619,10 +651,17 @@ export function sessionManager(parameters: sessionManager.Parameters): SessionMa
       }
     }
     signal?.throwIfAborted()
+    if (uncertainFunding) throw uncertainFunding
     const pending = operation()
     pendingTopUp = pending
     try {
       return await pending
+    } catch (error) {
+      if (error instanceof UncertainFundingError)
+        uncertainFunding = new Error(
+          'Session funding outcome is unknown; reconcile the pending payment before creating a new session manager.',
+        )
+      throw error
     } finally {
       if (pendingTopUp === pending) pendingTopUp = undefined
     }
@@ -636,60 +675,78 @@ export function sessionManager(parameters: sessionManager.Parameters): SessionMa
     knownDeposit?: bigint | undefined
     signal?: AbortSignal | undefined
   }) {
-    const { knownDeposit, ...topUp } = parameters
-    const receipt = await postTopUp({
-      ...topUp,
-      channel: runtime.channel,
-      createSessionCredential,
-      fetch: config.fetch,
-    })
-    updateSpentFromReceipt(receipt)
-    let baseline = runtime.channel
-    const applied = applyTopUpResult({
-      additionalDeposit: parameters.additionalDeposit,
-      channel: runtime.channel,
-      channelId: parameters.channelId,
-      challengeId: runtime.lastChallenge?.id,
-      currentState: runtime.state,
-      knownDeposit,
-      receipt,
-      spent: runtime.spent,
-    })
-    if (applied?.channel && runtime.lastChallenge) {
-      let entry = applied.channel
-      for (;;) {
-        await store.set(entry)
-        const current = runtime.channel
-        if (current === baseline) break
-        // A completed deposit must not restore a replaced session. For the same
-        // channel retain newer vouchers while recording the confirmed funding.
-        if (!current) return receipt
-        const funded = applied.channel
-        entry =
-          current.channelId !== funded.channelId
-            ? current
-            : {
-                ...current,
-                deposit: current.deposit > funded.deposit ? current.deposit : funded.deposit,
-                cumulativeAmount:
-                  current.cumulativeAmount > funded.cumulativeAmount
-                    ? current.cumulativeAmount
-                    : funded.cumulativeAmount,
-              }
-        baseline = current
-      }
-      if (entry.channelId !== applied.channel.channelId) return receipt
-      runtime.channel = entry
-      dispatch({
-        type: 'activated',
-        challengeId: runtime.lastChallenge.id,
-        entry,
-        spent: runtime.spent.toString(),
-        units: activeUnits(),
+    if (!runtime.channel) throw new Error('Cannot top up session: no active channel')
+    return withFundingLock(backing, entryKey(runtime.channel), async () => {
+      const { knownDeposit, ...topUp } = parameters
+      const stored = runtime.channel ? await store.get(entryKey(runtime.channel)) : undefined
+      if (stored?.channelId === parameters.channelId && stored.uncertainTopUp)
+        throw new Error(
+          'Session funding outcome is unknown; reconcile the pending payment before another top-up.',
+        )
+      const receipt = await postTopUp({
+        ...topUp,
+        channel: runtime.channel,
+        createSessionCredential,
+        fetch: config.fetch,
+        onUncertainFunding: async (channel) => {
+          const current = await store.get(entryKey(channel))
+          const unresolved = {
+            ...(current?.channelId === channel.channelId ? current : channel),
+            uncertainTopUp: true,
+          }
+          if (runtime.channel?.channelId === channel.channelId) runtime.channel = unresolved
+          await store.set(unresolved)
+          commitDurableTopUp(unresolved)
+        },
       })
-      commitDurableTopUp(entry)
-    }
-    return receipt
+      updateSpentFromReceipt(receipt)
+      let baseline = runtime.channel
+      const applied = applyTopUpResult({
+        additionalDeposit: parameters.additionalDeposit,
+        channel: runtime.channel,
+        channelId: parameters.channelId,
+        challengeId: runtime.lastChallenge?.id,
+        currentState: runtime.state,
+        knownDeposit,
+        receipt,
+        spent: runtime.spent,
+      })
+      if (applied?.channel && runtime.lastChallenge) {
+        let entry = applied.channel
+        for (;;) {
+          await store.set(entry)
+          const current = runtime.channel
+          if (current === baseline) break
+          // A completed deposit must not restore a replaced session. For the same
+          // channel retain newer vouchers while recording the confirmed funding.
+          if (!current) return receipt
+          const funded = applied.channel
+          entry =
+            current.channelId !== funded.channelId
+              ? current
+              : {
+                  ...current,
+                  deposit: current.deposit > funded.deposit ? current.deposit : funded.deposit,
+                  cumulativeAmount:
+                    current.cumulativeAmount > funded.cumulativeAmount
+                      ? current.cumulativeAmount
+                      : funded.cumulativeAmount,
+                }
+          baseline = current
+        }
+        if (entry.channelId !== applied.channel.channelId) return receipt
+        runtime.channel = entry
+        dispatch({
+          type: 'activated',
+          challengeId: runtime.lastChallenge.id,
+          entry,
+          spent: runtime.spent.toString(),
+          units: activeUnits(),
+        })
+        commitDurableTopUp(entry)
+      }
+      return receipt
+    })
   }
 
   async function topUpIfNeeded(parameters: TopUpRequirement) {
@@ -737,7 +794,7 @@ export function sessionManager(parameters: sessionManager.Parameters): SessionMa
         spent: restored.spent,
         units: restored.units,
       })
-      await backing.set(runtime.channel)
+      await persistChannel(runtime.channel)
     }
   }
 
@@ -746,7 +803,7 @@ export function sessionManager(parameters: sessionManager.Parameters): SessionMa
     runtime.channel = restored.channel
     runtime.spent = restored.spent
     runtime.state = restored.state
-    if (runtime.channel?.opened) await backing.set(runtime.channel)
+    if (runtime.channel?.opened) await persistChannel(runtime.channel)
   }
 
   function toPaymentResponse(response: Response): PaymentResponse {

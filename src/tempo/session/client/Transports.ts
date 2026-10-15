@@ -481,6 +481,8 @@ export type PostTopUpParameters = {
   input: RequestInfo | URL
   /** Cancels the top-up management request. */
   signal?: AbortSignal | undefined
+  /** Persists an unresolved funding outcome before another caller can reuse the channel. */
+  onUncertainFunding?: ((channel: ChannelEntry) => Promise<void>) | undefined
 }
 
 /** Inputs for retrying an HTTP 402 with a top-up/voucher management round trip. */
@@ -621,6 +623,16 @@ export async function readProblemDetail(response: Response) {
   }
 }
 
+/** A dispatched deposit may have executed despite a failed or cancelled response. */
+export class UncertainFundingError extends Error {
+  constructor(reason: unknown) {
+    const detail =
+      reason instanceof Error || reason instanceof DOMException ? reason.message : String(reason)
+    super(`${detail}; payment outcome unknown`)
+    this.name = 'UncertainFundingError'
+  }
+}
+
 /** Posts a top-up management credential and returns its receipt, when present. */
 export async function postTopUp(
   parameters: PostTopUpParameters,
@@ -630,6 +642,10 @@ export async function postTopUp(
     throw new Error('Cannot top up session: no local channel descriptor available.')
   }
 
+  if (channel.uncertainTopUp)
+    throw new Error(
+      'Session funding outcome is unknown; reconcile the pending payment before another top-up.',
+    )
   const response = await postManagementCredential({
     challenge: parameters.challenge,
     context: {
@@ -642,6 +658,12 @@ export async function postTopUp(
     fetch: parameters.fetch,
     input: parameters.input,
     signal: parameters.signal,
+  }).catch(async (error) => {
+    if (error instanceof UncertainFundingError) {
+      channel.uncertainTopUp = true
+      await parameters.onUncertainFunding?.(channel)
+    }
+    throw error
   })
   if (!response.ok) throw new Error(`Top-up POST failed with status ${response.status}`)
 
@@ -658,17 +680,48 @@ async function postManagementCredential(parameters: {
   input: RequestInfo | URL
   signal?: AbortSignal | undefined
 }): Promise<Response> {
-  const post = async (challenge: TempoSessionChallenge) =>
-    parameters.fetch(managementInput(parameters.input), {
-      method: 'POST',
-      ...(parameters.signal ? { signal: parameters.signal } : {}),
-      headers: {
-        [Constants.Headers.authorization]: await parameters.createSessionCredential(
-          challenge,
-          parameters.context,
+  const post = async (challenge: TempoSessionChallenge) => {
+    parameters.signal?.throwIfAborted()
+    const authorization = await parameters.createSessionCredential(challenge, parameters.context)
+    parameters.signal?.throwIfAborted()
+    const controller = new AbortController()
+    const abort = () => controller.abort(parameters.signal?.reason)
+    parameters.signal?.addEventListener('abort', abort, { once: true })
+    const timeout = setTimeout(
+      () =>
+        controller.abort(
+          new DOMException(
+            'Session management request timed out; payment outcome unknown',
+            'TimeoutError',
+          ),
         ),
-      },
+      30_000,
+    )
+    let onAbort!: () => void
+    const aborted = new Promise<never>((_, reject) => {
+      onAbort = () => reject(controller.signal.reason)
+      controller.signal.addEventListener('abort', onAbort, { once: true })
     })
+    try {
+      // Custom fetch implementations may ignore abort. Do not let their late
+      // response update funding state or trigger a refreshed-challenge retry.
+      return await Promise.race([
+        parameters.fetch(managementInput(parameters.input), {
+          method: 'POST',
+          signal: controller.signal,
+          headers: { [Constants.Headers.authorization]: authorization },
+        }),
+        aborted,
+      ])
+    } catch (error) {
+      if (parameters.context.action === 'topUp') throw new UncertainFundingError(error)
+      throw error
+    } finally {
+      clearTimeout(timeout)
+      parameters.signal?.removeEventListener('abort', abort)
+      controller.signal.removeEventListener('abort', onAbort)
+    }
+  }
   const response = await post(parameters.challenge)
   if (response.status !== 402) return response
   const challenge = Challenge.fromResponseList(response).find(isTip1034SessionChallenge)

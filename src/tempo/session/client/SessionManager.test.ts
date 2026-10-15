@@ -1484,6 +1484,149 @@ describe('Session', () => {
       }
     }
 
+    test('a stalled POST releases funding waiters with an unknown-outcome error', async () => {
+      vi.useFakeTimers()
+      const h = setup()
+      try {
+        const first = h.manager.topUp('5')
+        await vi.waitFor(() => expect(h.posted).toHaveLength(1))
+        const queued = h.manager.topUp('1')
+        const results = Promise.allSettled([first, queued])
+        await vi.advanceTimersByTimeAsync(30_000)
+        const settled = await results
+        expect(settled.map((result) => result.status)).toEqual(['rejected', 'rejected'])
+        for (const result of settled)
+          if (result.status === 'rejected')
+            expect(result.reason.message).toContain('payment outcome unknown')
+        await expect(h.manager.topUp('5')).rejects.toThrow('reconcile the pending payment')
+        await expect(h.consume(new AbortController().signal)).rejects.toThrow(
+          'reconcile the pending payment',
+        )
+        h.release()
+        await vi.advanceTimersByTimeAsync(0)
+        await expect(h.manager.topUp('5')).rejects.toThrow('reconcile the pending payment')
+        expect(h.posted).toHaveLength(1)
+        expect(h.manager.state).toMatchObject({ deposit: '5000000' })
+        expect(await h.storage.store.get(entryKey(h.entry))).toMatchObject({ uncertainTopUp: true })
+        const restarted = sessionManager({
+          account,
+          client,
+          fetch: h.fetch,
+          channelStore: h.storage.store,
+          maxDeposit: '10',
+        })
+        getSessionManagerInternals(restarted).rehydrate({
+          channel: (await h.storage.store.get(entryKey(h.entry)))!,
+          challenge: h.challenge,
+          input: h.input,
+          spent: 0n,
+        })
+        await expect(restarted.topUp('5')).rejects.toThrow('reconcile the pending payment')
+        expect(h.posted).toHaveLength(1)
+        expect(await h.storage.store.get(entryKey(h.entry))).toMatchObject({ uncertainTopUp: true })
+        h.fetch.mockRejectedValueOnce(new Error('close unavailable'))
+        await expect(h.manager.close()).rejects.toThrow('close unavailable')
+        expect(await h.storage.store.get(entryKey(h.entry))).toMatchObject({
+          uncertainTopUp: true,
+          channelId: h.entry.channelId,
+        })
+      } finally {
+        h.release()
+        vi.useRealTimers()
+      }
+    })
+
+    test.each(['http', 'network'] as const)(
+      'keeps uncertain channels when replacement fetch fails: %s',
+      async (failure) => {
+        const entry = channelEntry({ deposit: 5_000_000n, uncertainTopUp: true })
+        const storage = makeChannelStore([entry])
+        const actions: string[] = []
+        const fetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+          const authorization = new Headers(init?.headers).get('Authorization')
+          if (!authorization) return make402Response(makeChallenge({ amount: '1' }))
+          actions.push(
+            Credential.deserialize<SessionCredentialPayload>(authorization).payload.action,
+          )
+          if (failure === 'network') throw new Error('connection lost')
+          return new Response('unavailable', { status: 503 })
+        })
+        const manager = sessionManager({
+          account,
+          client,
+          fetch,
+          channelStore: storage.store,
+          maxDeposit: '10',
+        })
+        if (failure === 'network')
+          await expect(manager.fetch('https://api.example.com/data')).rejects.toThrow(
+            /connection lost|reconcile the pending payment/,
+          )
+        else expect((await manager.fetch('https://api.example.com/data')).status).toBe(503)
+        expect(actions).toEqual(['voucher'])
+        expect(storage.delete).not.toHaveBeenCalled()
+        expect(await storage.store.get(entryKey(entry))).toMatchObject({
+          uncertainTopUp: true,
+          channelId: entry.channelId,
+        })
+      },
+    )
+
+    test('does not discard unresolved funding when a new authority tries to replace the channel', async () => {
+      const foreignDescriptor = {
+        ...storedDescriptor,
+        payer: '0x0000000000000000000000000000000000000001' as Address,
+        authorizedSigner: '0x0000000000000000000000000000000000000001' as Address,
+      }
+      const entry = channelEntry({
+        uncertainTopUp: true,
+        descriptor: foreignDescriptor,
+        channelId: Channel.computeId({
+          ...foreignDescriptor,
+          chainId: 4217,
+          escrow: tip20ChannelEscrow,
+        }),
+      })
+      const storage = makeChannelStore([entry])
+      const fetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+        if (new Headers(init?.headers).has('Authorization'))
+          throw new Error('unexpected payment dispatch')
+        return make402Response()
+      })
+      const manager = sessionManager({
+        account,
+        client,
+        fetch,
+        channelStore: storage.store,
+        maxDeposit: '10',
+      })
+      await expect(manager.fetch('https://api.example.com/data')).rejects.toThrow(
+        'reconcile the pending payment',
+      )
+      expect(storage.delete).not.toHaveBeenCalled()
+      expect(await storage.store.get(entryKey(entry))).toMatchObject({
+        uncertainTopUp: true,
+        channelId: entry.channelId,
+      })
+    })
+
+    test('persists uncertainty when an in-flight automatic top-up is cancelled', async () => {
+      const h = setup()
+      const controller = new AbortController()
+      const pending = h.consume(controller.signal)
+      const rejected = expect(pending).rejects.toThrow('cancel funding')
+      try {
+        await vi.waitFor(() => expect(h.posted).toHaveLength(1))
+        controller.abort(new Error('cancel funding'))
+        await rejected
+        await expect(h.manager.topUp('5')).rejects.toThrow('reconcile the pending payment')
+        expect(await h.storage.store.get(entryKey(h.entry))).toMatchObject({ uncertainTopUp: true })
+        expect(h.posted).toHaveLength(1)
+      } finally {
+        h.release()
+      }
+    })
+
     test('aborts a queued flow before the in-flight top-up completes', async () => {
       const h = setup()
       const first = h.manager.topUp('5')
