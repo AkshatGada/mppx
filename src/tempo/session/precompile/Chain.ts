@@ -873,6 +873,7 @@ export async function sendCredentialTransaction(parameters: SendCredentialTransa
       client,
       FeePayer.simulationTransaction(transaction, { feePayer: true }),
     )
+    FeePayer.assertRemainingValidity({ transaction, details })
     const txHash = await sendTransaction(client, serializedTransaction)
     return waitForSuccessfulReceipt(client, txHash)
   }
@@ -897,7 +898,9 @@ export async function sendCredentialTransaction(parameters: SendCredentialTransa
       return { feePayer: feePayer.address, transaction: sponsored }
     },
   })
+  FeePayer.assertRemainingValidity({ transaction: completed.transaction, details })
   const serialized = await signTempoTransaction(client, completed.transaction)
+  FeePayer.assertRemainingValidity({ transaction: completed.transaction, details })
   const receipt = await sendRawTransactionSync(client, {
     serializedTransaction: serialized as Transaction.TransactionSerializedTempo,
   })

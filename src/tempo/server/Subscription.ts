@@ -1014,6 +1014,7 @@ async function submitSubscriptionPayment(parameters: {
         }
       },
     })
+    FeePayer.assertRemainingValidity({ transaction: completed.transaction })
     return await signTransaction(client, completed.transaction as never)
   })()
   const transaction = Transaction.deserialize(
@@ -1026,6 +1027,8 @@ async function submitSubscriptionPayment(parameters: {
       calls: transaction.calls,
       feePayerSignature: undefined,
     } as never)
+
+  if (feePayer) FeePayer.assertRemainingValidity({ transaction })
 
   if (!waitForConfirmation) {
     // Optimistic mode has no receipt to inspect, so it cannot detect a T6
