@@ -5257,3 +5257,91 @@ describe('onSessionSettlement', () => {
     ).rejects.toThrow(/broadcast failed/)
   })
 })
+
+test.each(
+  ['withdrawn', 'closing', 'rpc failure'].flatMap((failure) =>
+    [0, Number.MAX_SAFE_INTEGER].flatMap((ttl) =>
+      [5_001, -5_001].map((clockDelta) => ({ failure, ttl, clockDelta })),
+    ),
+  ),
+)(
+  'managed SSE stops delivering after escrow is $failure with TTL $ttl and clock change $clockDelta',
+  async ({ failure, ttl, clockDelta }) => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    try {
+      const rawStore = Store.memory()
+      const store = channelStore(rawStore)
+      const open = await createOpenPayload({ initialAmount: 100n })
+      await persistPrecompileChannel(store, open)
+      let unhealthy = false
+      const method = session({
+        amount: '1',
+        chainId,
+        currency: token,
+        decimals: 0,
+        recipient: payee,
+        sse: { pollingInterval: 100, beforeCharge: async () => {} } as { pollingInterval: number },
+        store: rawStore,
+        channelStateTtl: ttl,
+        getClient: () =>
+          createServerClient([], payer, undefined, {
+            state: () => {
+              if (unhealthy && failure === 'rpc failure')
+                throw new Error('RPC unavailable at https://private-rpc.example/secret-api-key')
+              return {
+                settled: 0n,
+                deposit: unhealthy && failure === 'withdrawn' ? 0n : 1_000n,
+                closeRequestedAt: unhealthy && failure === 'closing' ? 1 : 0,
+              }
+            },
+          }),
+      })
+      const rejectedVoucher = await ClientOps.createVoucherPayload(
+        createSigningClient(),
+        payer,
+        open.descriptor,
+        Types.uint96(250n),
+        chainId,
+      )
+      const challenge = {
+        ...makeChallenge(open.channelId),
+        request: { ...makeRequest(open.channelId), amount: '1' },
+      }
+      const credential = { challenge, payload: open }
+      const response = await method.transport!.respondReceipt({
+        challengeId: challenge.id,
+        credential,
+        receipt: {
+          method: 'tempo',
+          status: 'success',
+          timestamp: new Date().toISOString(),
+          reference: open.channelId,
+        },
+        input: new Request('https://api.example.com/stream'),
+        response: (async function* () {
+          yield 'first'
+          unhealthy = true
+          vi.setSystemTime(Date.now() + clockDelta)
+          if (failure === 'withdrawn') {
+            await expect(
+              method.verify({
+                credential: voucherCredential(rejectedVoucher, open.channelId),
+                request: verifyRequest(open.channelId),
+              }),
+            ).rejects.toThrow()
+          }
+          yield 'must not be delivered'
+        })(),
+      })
+      const reader = response.body!.getReader()
+      const first = await reader.read()
+      expect(new TextDecoder().decode(first.value)).toContain('first')
+      await expect(reader.read()).rejects.toThrow(
+        failure === 'rpc failure' ? 'Unable to verify stream escrow' : /channel/,
+      )
+      expect((await store.getChannel(open.channelId))!.spent).toBe(1n)
+    } finally {
+      vi.useRealTimers()
+    }
+  },
+)

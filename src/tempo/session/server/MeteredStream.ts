@@ -45,6 +45,8 @@ export type MeteredStreamOptions = {
   formatNeedVoucher(parameters: NeedVoucherEvent): string
   /** Async source or manual-charge source. */
   generate: SessionStreamGenerator
+  /** Verifies that the channel can still fund work and delivery; failures stop the stream. */
+  beforeCharge?: (() => MaybePromise<void>) | undefined
   /** Runs after a nonzero reserved charge has been committed. */
   onChargeCommitted?: ((channel: ChannelStore.State) => MaybePromise<unknown>) | undefined
   /** Store polling interval when `waitForUpdate` is unavailable. */
@@ -90,6 +92,8 @@ export async function* meterIterable(options: MeteredStreamOptions): AsyncGenera
   if (signal.aborted) releaseOnAbort()
   const charge = async (amount?: bigint) => {
     signal.throwIfAborted()
+    await options.beforeCharge?.()
+    signal.throwIfAborted()
     if (amount === undefined && prepaidUnits > 0) {
       prepaidUnits -= 1
       return
@@ -109,6 +113,8 @@ export async function* meterIterable(options: MeteredStreamOptions): AsyncGenera
   }
   const commit = async () => {
     signal.throwIfAborted()
+    await options.beforeCharge?.()
+    signal.throwIfAborted()
     if (!pending) return
     const channel = await commitReservedCharges(reservation)
     if (!channel) throw new Error('stream reservation was lost')
@@ -127,7 +133,7 @@ export async function* meterIterable(options: MeteredStreamOptions): AsyncGenera
         const { done, value } = await iterator.next()
         if (signal.aborted) break
         if (done) {
-          if (manual) await commit()
+          if (manual && pending) await commit()
           break
         }
         if (!manual) await charge()
