@@ -365,6 +365,11 @@ export function sessionManager(parameters: sessionManager.Parameters): SessionMa
       commitDurableTopUp(entry)
     },
   })
+  const handleMethodChallenge = MethodChallenge.get(method)
+  if (handleMethodChallenge)
+    MethodChallenge.register(method, (parameters) =>
+      withTopUpLock(() => Promise.resolve(handleMethodChallenge(parameters)), parameters.signal),
+    )
   MethodResponse.unregister(method)
   const chargeMethod = chargePlugin({
     allowedChainIds: parameters.allowedChainIds,
@@ -588,6 +593,41 @@ export function sessionManager(parameters: sessionManager.Parameters): SessionMa
     })
   }
 
+  let pendingTopUp: Promise<unknown> | undefined
+
+  // Keep funding decisions and their deposit updates atomic within this manager.
+  // Waiters share failures instead of immediately retrying an uncertain payment.
+  async function withTopUpLock<T>(operation: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+    for (;;) {
+      const pending = pendingTopUp
+      if (!pending) break
+      if (!signal) await pending
+      else {
+        signal.throwIfAborted()
+        let abort!: () => void
+        try {
+          await Promise.race([
+            pending,
+            new Promise<never>((_, reject) => {
+              abort = () => reject(signal.reason)
+              signal.addEventListener('abort', abort, { once: true })
+            }),
+          ])
+        } finally {
+          signal.removeEventListener('abort', abort)
+        }
+      }
+    }
+    signal?.throwIfAborted()
+    const pending = operation()
+    pendingTopUp = pending
+    try {
+      return await pending
+    } finally {
+      if (pendingTopUp === pending) pendingTopUp = undefined
+    }
+  }
+
   async function postTopUpAndApply(parameters: {
     additionalDeposit: bigint
     challenge: TempoSessionChallenge
@@ -604,6 +644,7 @@ export function sessionManager(parameters: sessionManager.Parameters): SessionMa
       fetch: config.fetch,
     })
     updateSpentFromReceipt(receipt)
+    let baseline = runtime.channel
     const applied = applyTopUpResult({
       additionalDeposit: parameters.additionalDeposit,
       channel: runtime.channel,
@@ -615,42 +656,68 @@ export function sessionManager(parameters: sessionManager.Parameters): SessionMa
       spent: runtime.spent,
     })
     if (applied?.channel && runtime.lastChallenge) {
-      await store.set(applied.channel)
+      let entry = applied.channel
+      for (;;) {
+        await store.set(entry)
+        const current = runtime.channel
+        if (current === baseline) break
+        // A completed deposit must not restore a replaced session. For the same
+        // channel retain newer vouchers while recording the confirmed funding.
+        if (!current) return receipt
+        const funded = applied.channel
+        entry =
+          current.channelId !== funded.channelId
+            ? current
+            : {
+                ...current,
+                deposit: current.deposit > funded.deposit ? current.deposit : funded.deposit,
+                cumulativeAmount:
+                  current.cumulativeAmount > funded.cumulativeAmount
+                    ? current.cumulativeAmount
+                    : funded.cumulativeAmount,
+              }
+        baseline = current
+      }
+      if (entry.channelId !== applied.channel.channelId) return receipt
+      runtime.channel = entry
       dispatch({
         type: 'activated',
         challengeId: runtime.lastChallenge.id,
-        entry: applied.channel,
+        entry,
         spent: runtime.spent.toString(),
         units: activeUnits(),
       })
-      commitDurableTopUp(applied.channel)
+      commitDurableTopUp(entry)
     }
     return receipt
   }
 
   async function topUpIfNeeded(parameters: TopUpRequirement) {
-    const channelDeposit =
-      runtime.channel?.channelId === parameters.channelId ? runtime.channel.deposit : 0n
-    const deposit = channelDeposit > parameters.deposit ? channelDeposit : parameters.deposit
-    const additionalDeposit = resolveAutomaticTopUp({
-      deposit,
-      maxDeposit: config.maxVoucherCumulative,
-      requiredCumulative: parameters.requiredCumulative,
-      suggestedDeposit:
-        parameters.challenge.request.suggestedDeposit === undefined
-          ? undefined
-          : BigInt(parameters.challenge.request.suggestedDeposit),
-      topUpAmount: config.topUpAmount,
-    })
-    if (additionalDeposit === 0n) return
-    await postTopUpAndApply({
-      challenge: parameters.challenge,
-      input: parameters.input,
-      channelId: parameters.channelId,
-      additionalDeposit,
-      knownDeposit: deposit,
-      signal: parameters.signal,
-    })
+    return withTopUpLock(async () => {
+      parameters.signal?.throwIfAborted()
+      const channelDeposit =
+        runtime.channel?.channelId === parameters.channelId ? runtime.channel.deposit : 0n
+      const deposit = channelDeposit > parameters.deposit ? channelDeposit : parameters.deposit
+      const additionalDeposit = resolveAutomaticTopUp({
+        deposit,
+        maxDeposit: config.maxVoucherCumulative,
+        requiredCumulative: parameters.requiredCumulative,
+        suggestedDeposit:
+          parameters.challenge.request.suggestedDeposit === undefined
+            ? undefined
+            : BigInt(parameters.challenge.request.suggestedDeposit),
+        topUpAmount: config.topUpAmount,
+      })
+      if (additionalDeposit === 0n) return
+      await postTopUpAndApply({
+        challenge: parameters.challenge,
+        input: parameters.input,
+        channelId: parameters.channelId,
+        additionalDeposit,
+        knownDeposit: deposit,
+        signal: parameters.signal,
+      })
+    }, parameters.signal)
   }
 
   async function restoreCumulative(channelId: Hex.Hex, cumulativeAmount: bigint) {
@@ -840,7 +907,7 @@ export function sessionManager(parameters: sessionManager.Parameters): SessionMa
     fetch: doFetch,
 
     async topUp(amount) {
-      const target = resolveManualTopUp({
+      const intended = resolveManualTopUp({
         amount,
         assertVoucherWithinLocalLimit,
         channel: runtime.channel,
@@ -848,12 +915,27 @@ export function sessionManager(parameters: sessionManager.Parameters): SessionMa
         lastChallenge: runtime.lastChallenge,
         lastUrl: runtime.lastUrl,
       })
-
-      return postTopUpAndApply({
-        additionalDeposit: target.additionalDeposit,
-        challenge: target.challenge,
-        channelId: target.channelId,
-        input: target.input,
+      return withTopUpLock(async () => {
+        if (
+          runtime.channel?.channelId !== intended.channelId ||
+          runtime.lastChallenge !== intended.challenge ||
+          runtime.lastUrl !== intended.input
+        )
+          throw new Error('Session changed while waiting to top up')
+        const target = resolveManualTopUp({
+          amount,
+          assertVoucherWithinLocalLimit,
+          channel: runtime.channel,
+          decimals: config.decimals,
+          lastChallenge: intended.challenge,
+          lastUrl: intended.input,
+        })
+        return postTopUpAndApply({
+          additionalDeposit: target.additionalDeposit,
+          challenge: target.challenge,
+          channelId: target.channelId,
+          input: target.input,
+        })
       })
     },
 
