@@ -206,6 +206,7 @@ export function charge(parameters: charge.Parameters = {}) {
               tokenOut: currency,
               tokenIn: autoSwap.tokenIn,
               slippage: autoSwap.slippage,
+              maxAmountIn: autoSwap.maxAmountIn,
             })
           : undefined
       }
