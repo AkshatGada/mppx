@@ -391,3 +391,47 @@ describe('fromRequest', () => {
     expect(() => Credential.fromRequest(request)).toThrow('Missing Payment scheme.')
   })
 })
+
+describe('authorization size limits', () => {
+  test.each([
+    'Bearer ' + 'a'.repeat(64 * 1024) + ', Payment abc',
+    'Basic a,'.repeat(64 * 1024),
+    ' '.repeat(64 * 1024) + 'Payment abc',
+    'Payment ' + 'a'.repeat(64 * 1024),
+  ])('rejects oversized input before extraction or decoding', (header) => {
+    expect(Credential.extractPaymentScheme(header)).toBeNull()
+    expect(() => Credential.deserialize(header)).toThrow(Credential.InvalidCredentialEncodingError)
+    expect(() =>
+      Credential.fromRequest(
+        new Request('https://example.com', {
+          headers: { Authorization: header },
+        }),
+      ),
+    ).toThrow()
+  })
+  test.each(['opaque', 'request'])('accepts an expanded %s from a valid challenge', (field) => {
+    const large = Challenge.from({
+      ...challenge,
+      ...(field === 'opaque'
+        ? { opaque: 'a'.repeat(12 * 1024) }
+        : { request: { data: 'a'.repeat(12277) } }),
+    })
+    const parsed = Challenge.deserialize(Challenge.serialize(large))
+    const header = Credential.serialize(
+      Credential.from({ challenge: parsed, payload: { type: 'hash', hash: '0x1' } }),
+    )
+    expect(header.length).toBeGreaterThan(16 * 1024)
+    expect(Credential.extractPaymentScheme(header)).toBe(header)
+    expect(Credential.deserialize(header).challenge).toEqual(parsed)
+  })
+  test('accepts a credential at the limit', () => {
+    const prefix = Credential.serialize(
+      Credential.from({ challenge, payload: { type: 'hash', hash: '0x1' } }),
+    )
+    const json = Base64.toString(prefix.slice('Payment '.length)).padEnd(49146, ' ')
+    const header = 'Payment ' + Base64.fromString(json, { url: true, pad: false })
+    expect(header).toHaveLength(64 * 1024)
+    expect(Credential.extractPaymentScheme(header)).toBe(header)
+    expect(Credential.deserialize(header).challenge).toEqual(challenge)
+  })
+})
