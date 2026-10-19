@@ -12,6 +12,7 @@ const bps = 10_000n
 export const defaultCurrencies: readonly Address[] = [
   defaults.tokens.pathUsd as Address,
   defaults.tokens.usdc as Address,
+  defaults.tokens.ousd as Address,
 ]
 
 /**
@@ -133,7 +134,11 @@ export function resolve(
   const tokenIn = value.tokenIn
     ? [
         ...value.tokenIn,
-        ...defaultCurrencies.filter((d) => !value.tokenIn!.some((c) => TempoAddress.isEqual(c, d))),
+        ...(value.fallback === false
+          ? []
+          : defaultCurrencies.filter(
+              (d) => !value.tokenIn!.some((c) => TempoAddress.isEqual(c, d)),
+            )),
       ]
     : defaultCurrencies
   return {
@@ -149,6 +154,11 @@ export declare namespace resolve {
     maxAmountIn?: bigint | undefined
     /** Fallback tokens to try swapping from, in priority order. */
     tokenIn?: Address[] | undefined
+    /**
+     * Whether to also try the default currencies after `tokenIn`. Set `false` to swap only from
+     * `tokenIn`, as an allowlist. Ignored without `tokenIn`. @default true
+     */
+    fallback?: boolean | undefined
     /** Max slippage tolerance as a percentage (e.g. `1` = 1%). @default 1 */
     slippage?: number | undefined
   }

@@ -9,6 +9,7 @@ describe('defaultCurrencies', () => {
       [
         "0x20c0000000000000000000000000000000000000",
         "0x20C000000000000000000000b9537d11c60E8b50",
+        "0x20c0000000000000000000006a37DA5C996874BE",
       ]
     `)
   })
@@ -32,6 +33,7 @@ describe('resolve', () => {
         "tokenIn": [
           "0x20c0000000000000000000000000000000000000",
           "0x20C000000000000000000000b9537d11c60E8b50",
+          "0x20c0000000000000000000006a37DA5C996874BE",
         ],
       }
     `)
@@ -44,6 +46,7 @@ describe('resolve', () => {
         "tokenIn": [
           "0x20c0000000000000000000000000000000000000",
           "0x20C000000000000000000000b9537d11c60E8b50",
+          "0x20c0000000000000000000006a37DA5C996874BE",
         ],
       }
     `)
@@ -56,6 +59,7 @@ describe('resolve', () => {
         "tokenIn": [
           "0x20c0000000000000000000000000000000000000",
           "0x20C000000000000000000000b9537d11c60E8b50",
+          "0x20c0000000000000000000006a37DA5C996874BE",
         ],
       }
     `)
@@ -70,6 +74,7 @@ describe('resolve', () => {
           "0x0000000000000000000000000000000000000099",
           "0x20c0000000000000000000000000000000000000",
           "0x20C000000000000000000000b9537d11c60E8b50",
+          "0x20c0000000000000000000006a37DA5C996874BE",
         ],
       }
     `)
@@ -82,6 +87,7 @@ describe('resolve', () => {
         "tokenIn": [
           "0x20c0000000000000000000000000000000000000",
           "0x20C000000000000000000000b9537d11c60E8b50",
+          "0x20c0000000000000000000006a37DA5C996874BE",
         ],
       }
     `)
@@ -96,9 +102,40 @@ describe('resolve', () => {
           "0x0000000000000000000000000000000000000099",
           "0x20c0000000000000000000000000000000000000",
           "0x20C000000000000000000000b9537d11c60E8b50",
+          "0x20c0000000000000000000006a37DA5C996874BE",
         ],
       }
     `)
+  })
+})
+
+describe('resolve with fallback: false', () => {
+  const custom = '0x1234567890abcdef1234567890abcdef12345678' as Address
+
+  test('swaps only from tokenIn', () => {
+    expect(resolve({ tokenIn: [custom], fallback: false }, defaultCurrencies)).toEqual({
+      slippage: 1,
+      tokenIn: [custom],
+    })
+  })
+
+  test('keeps a default currency listed in tokenIn', () => {
+    expect(
+      resolve({ tokenIn: [defaultCurrencies[1]!, custom], fallback: false }, defaultCurrencies),
+    ).toEqual({ slippage: 1, tokenIn: [defaultCurrencies[1], custom] })
+  })
+
+  test('fallback: true appends the defaults', () => {
+    expect(resolve({ tokenIn: [custom], fallback: true }, defaultCurrencies)).toEqual(
+      resolve({ tokenIn: [custom] }, defaultCurrencies),
+    )
+  })
+
+  test('is ignored without tokenIn', () => {
+    expect(resolve({ fallback: false }, defaultCurrencies)).toEqual({
+      slippage: 1,
+      tokenIn: defaultCurrencies,
+    })
   })
 })
 
