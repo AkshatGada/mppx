@@ -636,6 +636,7 @@ export function charge<const parameters extends charge.Parameters>(
             })
           }
 
+          Expires.assert(expires, challenge.id)
           return toReceipt(challenge.id)
         }
 
@@ -814,6 +815,9 @@ export function charge<const parameters extends charge.Parameters>(
                 transaction,
               })
 
+            // Authorize before the irreversible send; expiry must not turn a paid
+            // request into a fresh payment challenge while settlement completes.
+            Expires.assert(expires, challenge.id)
             broadcastAttempted = true
             if (waitForConfirmation) {
               const start = Date.now()

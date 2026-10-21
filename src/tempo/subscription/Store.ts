@@ -1,4 +1,4 @@
-import { Secp256k1 } from 'ox'
+import { Hex, Secp256k1 } from 'ox'
 import { Account as TempoAccount } from 'viem/tempo'
 
 import * as Store from '../../Store.js'
@@ -8,6 +8,7 @@ const defaultRecordPrefix = 'tempo:subscription:record:'
 const defaultKeyPrefix = 'tempo:subscription:key:'
 const defaultActivationPrefix = 'tempo:subscription:activation:'
 const defaultAccessKeyPrefix = 'tempo:subscription:access-key:'
+const defaultPendingAccessKeyPrefix = 'tempo:subscription:pending-access-key:'
 const defaultCredentialPrefix = 'tempo:subscription:credential:'
 const defaultActivationTimeoutMs = 15 * 60 * 1_000
 const defaultRenewalTimeoutMs = 15 * 60 * 1_000
@@ -25,9 +26,16 @@ export type SubscriptionStore = {
   /** Looks up a generated access key for a resolved request key. */
   getAccessKey(key: string): Promise<SubscriptionAccessKeyRecord | null>
   /** Looks up a generated access key by its public access key address. */
-  getAccessKeyByAddress(address: string): Promise<SubscriptionAccessKeyRecord | null>
+  getAccessKeyByAddress(
+    address: string,
+    keyToken?: `0x${string}`,
+  ): Promise<SubscriptionAccessKeyRecord | null>
   /** Looks up the active subscription for a resolved request key. */
   getByKey(key: string): Promise<SubscriptionRecord | null>
+  /** Creates a key sealed in a client-carried token, without retaining per-challenge state. */
+  createChallengeAccessKey(): Promise<SubscriptionAccessKeyRecord>
+  /** Retains a key after verified payment submission for subsequent subscription billing. */
+  retainAccessKey(key: string, record: SubscriptionAccessKeyRecord): Promise<void>
   /** Gets or creates the server-owned access key for a resolved request key. */
   getOrCreateAccessKey(key: string): Promise<SubscriptionAccessKeyRecord>
   /** Upserts a subscription record and marks it as active for its lookup key. */
@@ -89,6 +97,7 @@ export function fromStore(
     credentialPrefix = defaultCredentialPrefix,
     keyPrefix = defaultKeyPrefix,
     recordPrefix = defaultRecordPrefix,
+    pendingAccessKeyPrefix = defaultPendingAccessKeyPrefix,
     renewalTimeoutMs = defaultRenewalTimeoutMs,
   } = options ?? {}
 
@@ -153,7 +162,49 @@ export function fromStore(
     return marker?.challengeId === challengeId
   }
 
+  const sealingKey = `${pendingAccessKeyPrefix}sealing-key`
+
+  // One shared secret survives across workers; anonymous issuance never grows the store.
+  async function getSealingKey() {
+    const candidate = Hex.fromBytes(crypto.getRandomValues(new Uint8Array(32)))
+    const secret = await store.update(
+      sealingKey,
+      (current): Store.Change<unknown, `0x${string}`> =>
+        current
+          ? { op: 'noop', result: current as `0x${string}` }
+          : { op: 'set', value: candidate, result: candidate },
+    )
+    return crypto.subtle.importKey('raw', new Uint8Array(Hex.toBytes(secret)), 'AES-GCM', false, [
+      'encrypt',
+      'decrypt',
+    ])
+  }
+
   return {
+    async createChallengeAccessKey() {
+      const privateKey = Secp256k1.randomPrivateKey()
+      const account = TempoAccount.fromSecp256k1(privateKey)
+      const iv = crypto.getRandomValues(new Uint8Array(12))
+      const sealed = new Uint8Array(
+        await crypto.subtle.encrypt(
+          { name: 'AES-GCM', iv },
+          await getSealingKey(),
+          new Uint8Array(Hex.toBytes(privateKey)),
+        ),
+      )
+      return {
+        accessKeyAddress: account.address.toLowerCase() as `0x${string}`,
+        keyType: account.keyType,
+        privateKey,
+        keyToken: Hex.fromBytes(new Uint8Array([...iv, ...sealed])),
+      }
+    },
+
+    async retainAccessKey(key, record) {
+      await store.put(accessKeyKey(key), record)
+      await store.put(accessKeyAddressKey(record.accessKeyAddress), record)
+    },
+
     async activate({ challengeId, create, isReusable, lookupKey }) {
       const claimed = await store.update(credentialKey(challengeId), (current) => {
         if (current) return { op: 'noop', result: false }
@@ -255,8 +306,36 @@ export function fromStore(
       return (await store.get(accessKeyKey(key))) as SubscriptionAccessKeyRecord | null
     },
 
-    async getAccessKeyByAddress(address) {
-      return (await store.get(accessKeyAddressKey(address))) as SubscriptionAccessKeyRecord | null
+    async getAccessKeyByAddress(address, keyToken) {
+      const stored = (await store.get(
+        accessKeyAddressKey(address),
+      )) as SubscriptionAccessKeyRecord | null
+      if (stored) return stored
+      if (!keyToken) return null
+      try {
+        const bytes = Hex.toBytes(keyToken)
+        // 12-byte nonce, 32-byte private key, and 16-byte authentication tag.
+        if (bytes.length !== 60) return null
+        const privateKey = Hex.fromBytes(
+          new Uint8Array(
+            await crypto.subtle.decrypt(
+              { name: 'AES-GCM', iv: bytes.slice(0, 12) },
+              await getSealingKey(),
+              bytes.slice(12),
+            ),
+          ),
+        )
+        const account = TempoAccount.fromSecp256k1(privateKey)
+        if (account.address.toLowerCase() !== address.toLowerCase()) return null
+        return {
+          accessKeyAddress: account.address.toLowerCase() as `0x${string}`,
+          keyType: account.keyType,
+          privateKey,
+          keyToken,
+        }
+      } catch {
+        return null
+      }
     },
 
     async getByKey(key) {
@@ -409,6 +488,8 @@ export declare namespace fromStore {
   type Options = {
     /** Key prefix for server-owned subscription access keys. @default `'tempo:subscription:access-key:'` */
     accessKeyPrefix?: string | undefined
+    /** Namespace for the persistent anonymous-challenge sealing key. */
+    pendingAccessKeyPrefix?: string | undefined
     /** Key prefix for resolved subscription activation locks. @default `'tempo:subscription:activation:'` */
     activationPrefix?: string | undefined
     /** Milliseconds before a stuck activation lock can be replaced. @default `900000` */

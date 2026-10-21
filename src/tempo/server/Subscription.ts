@@ -460,12 +460,11 @@ async function resolveChallengeAccessKey(parameters: {
 async function createUnboundChallengeAccessKey(parameters: {
   store: SubscriptionStore.SubscriptionStore
 }) {
-  const accessKey = await parameters.store.getOrCreateAccessKey(
-    `challenge:${createSubscriptionId()}`,
-  )
+  const accessKey = await parameters.store.createChallengeAccessKey()
   return {
     accessKeyAddress: accessKey.accessKeyAddress,
     keyType: accessKey.keyType,
+    keyToken: accessKey.keyToken,
   } satisfies SubscriptionAccessKey
 }
 
@@ -919,8 +918,8 @@ async function submitSubscriptionPayment(parameters: {
     waitForConfirmation,
   } = parameters
   const stored =
-    (await store.getAccessKey(lookupKey)) ??
-    (await store.getAccessKeyByAddress(accessKey.accessKeyAddress))
+    (await store.getAccessKeyByAddress(accessKey.accessKeyAddress, accessKey.keyToken)) ??
+    (await store.getAccessKey(lookupKey))
   if (!stored) {
     throw new VerificationFailedError({ reason: 'subscription access key is missing' })
   }
@@ -1033,9 +1032,11 @@ async function submitSubscriptionPayment(parameters: {
   if (!waitForConfirmation) {
     // Optimistic mode has no receipt to inspect, so it cannot detect a T6
     // (TIP-1028) held transfer. Use `waitForConfirmation: true` for T6-safe proof.
-    return sendRawTransaction(client, {
+    const hash = await sendRawTransaction(client, {
       serializedTransaction: serializedTransaction as Transaction.TransactionSerializedTempo,
     })
+    await store.retainAccessKey(lookupKey, stored)
+    return hash
   }
 
   const receipt = await sendRawTransactionSync(client, {
@@ -1052,6 +1053,7 @@ async function submitSubscriptionPayment(parameters: {
     memo,
     recipient: request.recipient as Address,
   })
+  await store.retainAccessKey(lookupKey, stored)
   return receipt.transactionHash
 }
 

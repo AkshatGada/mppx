@@ -544,59 +544,100 @@ describe('tempo.subscription', () => {
     expect(reused.status).toBe(200)
   })
 
-  test('can derive the subscription lookup key only from the signed credential source', async () => {
-    const store = Store.memory()
-    const subscriptions = SubscriptionStore.fromStore(store)
-    const { client, rpcMethods } = createBillingClient([hashActivate])
-    const sourceKey = (source: { address: string; chainId: number }) =>
-      `payer:${source.chainId}:${source.address.toLowerCase()}:pro`
-    const method = subscription({
-      amount: subscriptionAmount,
-      chainId,
-      currency: subscriptionCurrency,
-      getClient: async () => client,
-      periodCount: subscriptionPeriodCount,
-      periodUnit: subscriptionPeriodUnit,
-      recipient: subscriptionRecipient,
-      requireCredential: true,
-      resolve: async ({ source }) => {
-        if (!source) return null
-        return { key: sourceKey(source) }
-      },
-      store,
-      subscriptionExpires: activeSubscriptionExpires,
-      waitForConfirmation: false,
-    })
+  test.each([false, true])(
+    'retains anonymous challenge keys only after successful activation (fails: %s)',
+    async (fails) => {
+      const store = Store.memory()
+      const subscriptions = SubscriptionStore.fromStore(store)
+      const { client, rpcMethods } = createBillingClient([hashActivate, hashRenewed], {
+        failSimulation: fails ? 1 : undefined,
+      })
+      const sourceKey = (source: { address: string; chainId: number }) =>
+        `payer:${source.chainId}:${source.address.toLowerCase()}:pro`
+      const method = subscription({
+        amount: subscriptionAmount,
+        chainId,
+        currency: subscriptionCurrency,
+        getClient: async () => client,
+        periodCount: subscriptionPeriodCount,
+        periodUnit: subscriptionPeriodUnit,
+        recipient: subscriptionRecipient,
+        requireCredential: true,
+        resolve: async ({ source }) => {
+          if (!source) return null
+          return { key: sourceKey(source) }
+        },
+        store,
+        subscriptionExpires: activeSubscriptionExpires,
+        waitForConfirmation: false,
+      })
 
-    const mppx = Mppx.create({ methods: [method], realm, secretKey })
-    const challengeResult = await mppx.tempo.subscription({})(
-      new Request('https://example.com/resource'),
-    )
+      const mppx = Mppx.create({ methods: [method], realm, secretKey })
+      const challengeResult = await mppx.tempo.subscription({})(
+        new Request('https://example.com/resource'),
+      )
 
-    expect(challengeResult.status).toBe(402)
-    if (challengeResult.status !== 402) throw new Error('expected source challenge')
+      expect(challengeResult.status).toBe(402)
+      if (challengeResult.status !== 402) throw new Error('expected source challenge')
 
-    const challenge = Challenge.fromResponse(challengeResult.challenge)
-    const challengeAccessKey = (
-      challenge.request as ReturnType<typeof Methods.subscription.schema.request.parse>
-    ).methodDetails?.accessKey
-    if (!challengeAccessKey) throw new Error('expected challenge access key')
+      const challenge = Challenge.fromResponse(challengeResult.challenge)
+      const challengeAccessKey = (
+        challenge.request as ReturnType<typeof Methods.subscription.schema.request.parse>
+      ).methodDetails?.accessKey
+      if (!challengeAccessKey) throw new Error('expected challenge access key')
 
-    const credential = await createCredential(challenge, rootAccount.address, challengeAccessKey)
-    const activated = await mppx.tempo.subscription({})(
-      new Request('https://example.com/resource', {
-        headers: { Authorization: Credential.serialize(credential) },
-      }),
-    )
+      const credential = await createCredential(challenge, rootAccount.address, challengeAccessKey)
+      const activated = await mppx.tempo.subscription({})(
+        new Request('https://example.com/resource', {
+          headers: { Authorization: Credential.serialize(credential) },
+        }),
+      )
 
-    expect(activated.status).toBe(200)
-    const lookupKey = sourceKey({ address: rootAccount.address, chainId })
-    const record = await subscriptions.getByKey(lookupKey)
-    expect(record?.lookupKey).toBe(lookupKey)
-    expect(record?.payer?.address.toLowerCase()).toBe(rootAccount.address.toLowerCase())
-    expect(record?.accessKey).toEqual(challengeAccessKey)
-    expect(rpcMethods.filter((method) => method === 'eth_sendRawTransaction')).toHaveLength(1)
-  })
+      if (fails) {
+        expect(activated.status).toBe(402)
+        expect(
+          await subscriptions.getAccessKey(sourceKey({ address: rootAccount.address, chainId })),
+        ).toBeNull()
+        expect(
+          await store.get(
+            `tempo:subscription:access-key:address:${challengeAccessKey.accessKeyAddress.toLowerCase()}`,
+          ),
+        ).toBeNull()
+        return
+      }
+      expect(activated.status).toBe(200)
+      const lookupKey = sourceKey({ address: rootAccount.address, chainId })
+      const record = await subscriptions.getByKey(lookupKey)
+      expect(record?.lookupKey).toBe(lookupKey)
+      expect(record?.payer?.address.toLowerCase()).toBe(rootAccount.address.toLowerCase())
+      expect(record?.accessKey).toEqual(challengeAccessKey)
+      expect(rpcMethods.filter((method) => method === 'eth_sendRawTransaction')).toHaveLength(1)
+      if (!record) throw new Error('expected activated subscription')
+      await subscriptions.put({
+        ...record,
+        subscriptionExpires: new Date(Date.now() - 1_000).toISOString(),
+      })
+      const next = await mppx.tempo.subscription({})(new Request('https://example.com/resource'))
+      if (next.status !== 402) throw new Error('expected re-subscription challenge')
+      const freshChallenge = Challenge.fromResponse(next.challenge)
+      const freshKey = (
+        freshChallenge.request as ReturnType<typeof Methods.subscription.schema.request.parse>
+      ).methodDetails?.accessKey
+      if (!freshKey) throw new Error('expected fresh key')
+      expect(freshKey.accessKeyAddress).not.toBe(challengeAccessKey.accessKeyAddress)
+      const freshCredential = await createCredential(freshChallenge, rootAccount.address, freshKey)
+      const reactivated = await mppx.tempo.subscription({})(
+        new Request('https://example.com/resource', {
+          headers: { Authorization: Credential.serialize(freshCredential) },
+        }),
+      )
+      expect(reactivated.status).toBe(200)
+      expect((await subscriptions.getAccessKey(lookupKey))?.accessKeyAddress).toBe(
+        freshKey.accessKeyAddress,
+      )
+      expect(rpcMethods.filter((method) => method === 'eth_sendRawTransaction')).toHaveLength(2)
+    },
+  )
 
   test('rejects credential reuse when the signer does not match the stored payer', async () => {
     const store = Store.memory()
@@ -2143,3 +2184,42 @@ test.each([tokens.ousd, tokens.usdc])(
     expect(record?.currency).toBe(currency.toLowerCase())
   },
 )
+
+test('anonymous subscription probes do not create permanent key indexes', async () => {
+  const backing = Store.memory()
+  const written = new Set<string>()
+  const store: Store.AtomicStore = {
+    ...backing,
+    async put(key, value) {
+      written.add(key)
+      return backing.put(key, value)
+    },
+    async update(key, fn) {
+      written.add(key)
+      return backing.update(key, fn)
+    },
+  }
+  const method = subscription({
+    amount: subscriptionAmount,
+    chainId,
+    currency: subscriptionCurrency,
+    periodCount: subscriptionPeriodCount,
+    periodUnit: subscriptionPeriodUnit,
+    recipient: subscriptionRecipient,
+    requireCredential: true,
+    resolve: async () => null,
+    store,
+    subscriptionExpires: activeSubscriptionExpires,
+  })
+  const mppx = Mppx.create({ methods: [method], realm, secretKey })
+  for (let i = 0; i < 1030; i++) {
+    const result = await mppx.tempo.subscription({})(new Request('https://example.com/resource'))
+    expect(result.status).toBe(402)
+    if (result.status !== 402) throw new Error('expected challenge')
+    const challenge = Challenge.fromResponse(result.challenge)
+    expect(challenge.request).toMatchObject({
+      methodDetails: { accessKey: { keyToken: expect.any(String) } },
+    })
+  }
+  expect([...written]).toEqual(['tempo:subscription:pending-access-key:sealing-key'])
+})

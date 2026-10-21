@@ -296,7 +296,8 @@ function toSelectedChallengeResponse(challenge: Challenge.Challenge, response: R
 
 /** Resolves the actual fetch target and required Host header for a local subdomain. */
 function resolveFetchTarget(url: string): { host?: string | undefined; url: string } {
-  const { host, hostname } = new URL(url)
+  const { host, hostname, protocol } = new URL(url)
+  if (protocol === 'https:') return { url }
   if (!hostname.endsWith('.localhost') || hostname === 'localhost') return { url }
   return { host, url: url.replace(hostname, '127.0.0.1') }
 }
@@ -460,7 +461,7 @@ const cli = Cli.create('mppx', {
     insecure: z
       .boolean()
       .optional()
-      .describe('Skip TLS certificate verification (true for localhost/.local)'),
+      .describe('Skip TLS certificate verification (disables payment retries)'),
     jsonBody: z
       .string()
       .optional()
@@ -554,11 +555,7 @@ const cli = Cli.create('mppx', {
       return hasProtocol ? c.args.url : `${isLocal ? 'http' : 'https'}://${c.args.url}`
     })()
     const { hostname } = new URL(url)
-    const insecure =
-      c.options.insecure ||
-      hostname === 'localhost' ||
-      hostname.endsWith('.localhost') ||
-      hostname.endsWith('.local')
+    const insecure = c.options.insecure ?? false
 
     // Scoped fetch that temporarily disables TLS verification only for
     // the target connection when `insecure` is true, then restores
@@ -577,8 +574,8 @@ const cli = Cli.create('mppx', {
       : globalThis.fetch
 
     // Node.js doesn't resolve *.localhost subdomains to loopback (unlike
-    // browsers per RFC 6761). Rewrite the URL to 127.0.0.1 and set the
-    // Host header so reverse proxies can route correctly.
+    // browsers per RFC 6761). Rewrite plain HTTP to loopback. HTTPS keeps
+    // its hostname for certificate validation and uses the system resolver.
     const initialTarget = resolveFetchTarget(url)
     const fetchUrl = initialTarget.url
     if (initialTarget.host) headers.Host = initialTarget.host
@@ -613,6 +610,13 @@ const cli = Cli.create('mppx', {
         c.options.location ?? false,
       )
       const challengeResponse = challengeRequest.response
+      if (insecure && challengeResponse.status === 402)
+        return c.error({
+          code: 'INSECURE_PAYMENT',
+          message:
+            'Payment requires verified TLS. Install a trusted certificate and omit --insecure.',
+          exitCode: 2,
+        })
       if (challengeResponse.status !== 402) {
         if (c.options.session !== 'auto')
           return c.error({

@@ -607,3 +607,31 @@ describe('tempo subscription store', () => {
     expect((await store.getByKey('user-1:plan:pro'))?.subscriptionId).toBe('sub_new')
   })
 })
+
+test('seals anonymous keys without a capacity limit or per-challenge state', async () => {
+  const raw = Store.memory()
+  const store = fromStore(raw)
+  const key = await store.createChallengeAccessKey()
+  expect(await store.getAccessKeyByAddress(key.accessKeyAddress)).toBeNull()
+  expect(await store.getAccessKeyByAddress(key.accessKeyAddress, key.keyToken)).toEqual(key)
+  for (let i = 0; i < 1025; i++) await store.createChallengeAccessKey()
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 60 * 60_000)
+  try {
+    expect(await store.getAccessKeyByAddress(key.accessKeyAddress, key.keyToken)).toEqual(key)
+  } finally {
+    clock.mockRestore()
+  }
+  const otherWorker = fromStore(raw)
+  expect(await otherWorker.getAccessKeyByAddress(key.accessKeyAddress, key.keyToken)).toEqual(key)
+  const other = await store.createChallengeAccessKey()
+  expect(await store.getAccessKeyByAddress(other.accessKeyAddress, key.keyToken)).toBeNull()
+  const corrupted =
+    `${key.keyToken!.slice(0, -2)}${key.keyToken!.endsWith('00') ? '01' : '00'}` as `0x${string}`
+  expect(await store.getAccessKeyByAddress(key.accessKeyAddress, corrupted)).toBeNull()
+  expect(
+    await fromStore(Store.memory()).getAccessKeyByAddress(key.accessKeyAddress, key.keyToken),
+  ).toBeNull()
+  await store.retainAccessKey('verified-payer', key)
+  expect(await store.getAccessKeyByAddress(key.accessKeyAddress)).toEqual(key)
+  expect(await raw.get('tempo:subscription:pending-access-key:pool')).toBeNull()
+})
